@@ -1,0 +1,34 @@
+{
+  "name": "pi-custom-provider",
+  "version": "0.1.0",
+  "description": "Pi extension package for adding and deleting custom providers through an interactive wizard.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "custom-provider"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ratatulieoi/pi-custom-provider.git"
+  },
+  "homepage": "https://github.com/ratatulieoi/pi-custom-provider#readme",
+  "bugs": {
+    "url": "https://github.com/ratatulieoi/pi-custom-provider/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "scripts": {
+    "build": "echo 'No build step required'",
+    "check": "echo 'No build step required'"
+  }
+}
