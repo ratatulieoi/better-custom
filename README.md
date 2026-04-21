@@ -1,4 +1,4 @@
-# pi-custom-provider
+# better-custom
 
 A shareable [pi](https://github.com/badlogic/pi-mono) package that adds a `/better-custom` command for managing custom providers in `~/.pi/agent/models.json`.
 
@@ -24,13 +24,13 @@ A shareable [pi](https://github.com/badlogic/pi-mono) package that adds a `/bett
 Install directly from GitHub:
 
 ```bash
-pi install git:github.com/ratatulieoi/pi-custom-provider
+pi install git:github.com/ratatulieoi/better-custom
 ```
 
 Or:
 
 ```bash
-pi install https://github.com/ratatulieoi/pi-custom-provider
+pi install https://github.com/ratatulieoi/better-custom
 ```
 
 ## Usage
@@ -60,7 +60,7 @@ When adding a provider, it will guide you through:
 Anyone can install this package with:
 
 ```bash
-pi install git:github.com/ratatulieoi/pi-custom-provider
+pi install git:github.com/ratatulieoi/better-custom
 ```
 
 ## Files

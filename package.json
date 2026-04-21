@@ -1,5 +1,5 @@
 {
-  "name": "pi-custom-provider",
+  "name": "better-custom",
   "version": "0.1.0",
   "description": "Pi extension package for adding and deleting custom providers through an interactive wizard.",
   "type": "module",
@@ -7,16 +7,16 @@
     "pi-package",
     "pi",
     "pi-extension",
-    "custom-provider"
+    "better-custom"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ratatulieoi/pi-custom-provider.git"
+    "url": "git+https://github.com/ratatulieoi/better-custom.git"
   },
-  "homepage": "https://github.com/ratatulieoi/pi-custom-provider#readme",
+  "homepage": "https://github.com/ratatulieoi/better-custom#readme",
   "bugs": {
-    "url": "https://github.com/ratatulieoi/pi-custom-provider/issues"
+    "url": "https://github.com/ratatulieoi/better-custom/issues"
   },
   "pi": {
     "extensions": [
