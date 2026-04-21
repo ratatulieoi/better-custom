@@ -432,7 +432,7 @@ async function deleteProviderFlow(ctx: Parameters<Parameters<ExtensionAPI["regis
 }
 
 export default function customProviderWizard(pi: ExtensionAPI) {
-	pi.registerCommand("custom-provider", {
+	pi.registerCommand("better-custom", {
 		description: "Wizard for adding or deleting custom providers in ~/.pi/agent/models.json",
 		handler: async (_args, ctx) => {
 			const action = await ctx.ui.select("Custom provider", ["Add provider", "Delete provider"]);

@@ -1,6 +1,6 @@
 # pi-custom-provider
 
-A shareable [pi](https://github.com/badlogic/pi-mono) package that adds a `/custom-provider` command for managing custom providers in `~/.pi/agent/models.json`.
+A shareable [pi](https://github.com/badlogic/pi-mono) package that adds a `/better-custom` command for managing custom providers in `~/.pi/agent/models.json`.
 
 ## Features
 
@@ -38,7 +38,7 @@ pi install https://github.com/ratatulieoi/pi-custom-provider
 After installing, reload pi if needed, then run:
 
 ```text
-/custom-provider
+/better-custom
 ```
 
 The wizard can:
