@@ -1,6 +1,6 @@
 # better-custom
 
-A better way to add custom provider
+A better way to add custom provider for Pi coding agnet
 
 ## Features
 
