@@ -1,6 +1,6 @@
 # better-custom
 
-A shareable [pi](https://github.com/badlogic/pi-mono) package that adds a `/better-custom` command for managing custom providers in `~/.pi/agent/models.json`.
+A better way to add custom provider
 
 ## Features
 
@@ -50,18 +50,10 @@ When adding a provider, it will guide you through:
 
 - provider style
 - endpoint
-- provider id
+- provider name 
 - API key method
 - model discovery or manual model entry
 - reasoning flag
-
-## Share with others
-
-Anyone can install this package with:
-
-```bash
-pi install git:github.com/ratatulieoi/better-custom
-```
 
 ## Files
 
