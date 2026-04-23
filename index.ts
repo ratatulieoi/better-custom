@@ -19,6 +19,16 @@ type ProbeItem = {
 	description?: string;
 };
 
+type SelectItem = {
+	value: string;
+	label: string;
+	suffix?: string;
+	description?: string;
+	searchText?: string;
+};
+
+type CommandContext = Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1];
+
 const MODELS_JSON_PATH = `${homedir()}/.pi/agent/models.json`;
 const BUILTIN_PROVIDER_IDS = new Set([
 	"anthropic",
@@ -190,8 +200,135 @@ async function probeOpenAIModels(baseUrl: string, apiKeyMode: ApiKeyMode, apiKey
 	return ids.map((id) => ({ value: id, label: id }));
 }
 
+function normalizeSelectItems(items: Array<string | SelectItem>): SelectItem[] {
+	return items.map((item) => (typeof item === "string" ? { value: item, label: item } : item));
+}
+
+async function selectOne(
+	ctx: CommandContext,
+	title: string,
+	items: Array<string | SelectItem>,
+	options?: { initialIndex?: number },
+): Promise<string | null> {
+	const normalizedItems = normalizeSelectItems(items);
+	if (normalizedItems.length === 0) return null;
+
+	return await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+		let cursor = Math.max(0, Math.min(options?.initialIndex ?? 0, normalizedItems.length - 1));
+		let query = "";
+		let cachedLines: string[] | undefined;
+		const maxVisible = 12;
+
+		function getVisibleItems() {
+			const lowerQuery = query.trim().toLowerCase();
+			if (!lowerQuery) return normalizedItems;
+			return normalizedItems.filter((item) => {
+				const haystack = `${item.label} ${item.suffix ?? ""} ${item.description ?? ""} ${item.searchText ?? ""}`.toLowerCase();
+				return haystack.includes(lowerQuery);
+			});
+		}
+
+		function refresh() {
+			const visibleItems = getVisibleItems();
+			if (visibleItems.length === 0) cursor = 0;
+			else if (cursor >= visibleItems.length) cursor = visibleItems.length - 1;
+			cachedLines = undefined;
+			tui.requestRender();
+		}
+
+		return {
+			render(width: number) {
+				if (cachedLines) return cachedLines;
+
+				const visibleItems = getVisibleItems();
+				const safeWidth = Math.max(10, width);
+				const lines: string[] = [];
+				const add = (line = "") => lines.push(truncateToWidth(line, safeWidth));
+				const border = theme.fg("accent", "─".repeat(safeWidth));
+
+				add(border);
+				add(` ${theme.fg("accent", theme.bold(title))}`);
+				add(` ${theme.fg("text", `Search: ${query || "-"}`)}`);
+				add();
+
+				if (visibleItems.length === 0) {
+					add(theme.fg("warning", " No matches."));
+				} else {
+					const start = Math.max(0, Math.min(cursor - Math.floor(maxVisible / 2), Math.max(0, visibleItems.length - maxVisible)));
+					const end = Math.min(visibleItems.length, start + maxVisible);
+
+					for (let i = start; i < end; i++) {
+						const item = visibleItems[i];
+						const active = i === cursor;
+						const prefix = active ? theme.fg("accent", "> ") : "  ";
+						const label = active ? theme.fg("accent", item.label) : theme.fg("text", item.label);
+						const suffix = item.suffix ? theme.fg("dim", item.suffix) : "";
+						add(`${prefix}${label}${suffix}`);
+						if (item.description) {
+							for (const line of item.description.split("\n")) {
+								add(`   ${theme.fg("muted", line)}`);
+							}
+						}
+					}
+
+					if (visibleItems.length > maxVisible) {
+						add();
+						add(theme.fg("dim", ` ${start + 1}-${end} of ${visibleItems.length}`));
+					}
+				}
+
+				add();
+				add(theme.fg("dim", " Type to search • ↑↓ move (wraps) • enter confirm • backspace delete • esc cancel"));
+				add(border);
+
+				cachedLines = lines;
+				return lines;
+			},
+			invalidate() {
+				cachedLines = undefined;
+			},
+			handleInput(data: string) {
+				const visibleItems = getVisibleItems();
+				if (matchesKey(data, Key.up)) {
+					if (visibleItems.length === 0) return;
+					cursor = cursor === 0 ? visibleItems.length - 1 : cursor - 1;
+					refresh();
+					return;
+				}
+				if (matchesKey(data, Key.down)) {
+					if (visibleItems.length === 0) return;
+					cursor = cursor === visibleItems.length - 1 ? 0 : cursor + 1;
+					refresh();
+					return;
+				}
+				if (matchesKey(data, Key.enter)) {
+					const item = visibleItems[cursor];
+					done(item?.value ?? null);
+					return;
+				}
+				if (matchesKey(data, Key.escape)) {
+					done(null);
+					return;
+				}
+				if (data === "\u007f" || data === "\b") {
+					if (query.length > 0) {
+						query = query.slice(0, -1);
+						refresh();
+					}
+					return;
+				}
+				if (data >= " " && data !== "\u001b" && data !== "\r" && data !== "\n") {
+					query += data;
+					cursor = 0;
+					refresh();
+				}
+			},
+		};
+	});
+}
+
 async function pickMany(
-	ctx: Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1],
+	ctx: CommandContext,
 	title: string,
 	items: ProbeItem[],
 ): Promise<string[] | null> {
@@ -242,7 +379,7 @@ async function pickMany(
 				}
 
 				add();
-				add(theme.fg("dim", " ↑↓ move • space toggle • enter confirm • esc cancel"));
+				add(theme.fg("dim", " ↑↓ move (wraps) • space toggle • enter confirm • esc cancel"));
 				if (selected.size === 0) {
 					add(theme.fg("warning", " Select at least one model before confirming."));
 				}
@@ -256,12 +393,12 @@ async function pickMany(
 			},
 			handleInput(data: string) {
 				if (matchesKey(data, Key.up)) {
-					cursor = Math.max(0, cursor - 1);
+					cursor = cursor === 0 ? items.length - 1 : cursor - 1;
 					refresh();
 					return;
 				}
 				if (matchesKey(data, Key.down)) {
-					cursor = Math.min(items.length - 1, cursor + 1);
+					cursor = cursor === items.length - 1 ? 0 : cursor + 1;
 					refresh();
 					return;
 				}
@@ -286,9 +423,9 @@ async function pickMany(
 }
 
 async function promptApiKey(
-	ctx: Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1],
+	ctx: CommandContext,
 ): Promise<{ mode: ApiKeyMode; value?: string } | null> {
-	const choice = await ctx.ui.select("API key", [
+	const choice = await selectOne(ctx, "API key", [
 		"Environment variable name",
 		"Literal API key",
 		"Shell command",
@@ -322,7 +459,7 @@ async function promptApiKey(
 }
 
 async function promptModelIdsOneByOne(
-	ctx: Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1],
+	ctx: CommandContext,
 	style: ProviderStyle,
 	api: ProviderApi,
 ): Promise<string[] | null> {
@@ -396,53 +533,90 @@ function describeProvider(providerId: string, provider: any): string {
 	return `${providerId}\n${api} • ${modelCount} model${modelCount === 1 ? "" : "s"}\n${endpoint}`;
 }
 
-async function deleteProviderFlow(ctx: Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1]) {
-	let config: ModelsConfig;
-	try {
-		config = loadModelsConfig();
-	} catch (error) {
-		ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
-		return;
+function describeProviderInline(providerId: string, provider: any): { label: string; suffix: string; searchText: string } {
+	const modelCount = Array.isArray(provider?.models) ? provider.models.length : 0;
+	const endpoint = typeof provider?.baseUrl === "string" ? provider.baseUrl : "(no baseUrl)";
+	const api = typeof provider?.api === "string" ? provider.api : "(no api)";
+	const suffix = ` • ${api} • ${endpoint} • ${modelCount} model${modelCount === 1 ? "" : "s"}`;
+	return {
+		label: providerId,
+		suffix,
+		searchText: `${providerId} ${api} ${endpoint} ${modelCount}`,
+	};
+}
+
+async function deleteProviderFlow(ctx: CommandContext) {
+	let cursor = 0;
+	let deletedAny = false;
+
+	while (true) {
+		let config: ModelsConfig;
+		try {
+			config = loadModelsConfig();
+		} catch (error) {
+			ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+
+		config.providers ||= {};
+		const providerIds = Object.keys(config.providers).sort((a, b) => a.localeCompare(b));
+		if (providerIds.length === 0) {
+			ctx.ui.notify(
+				deletedAny ? `No providers left in ${MODELS_JSON_PATH}` : `No providers found in ${MODELS_JSON_PATH}`,
+				deletedAny ? "info" : "warning",
+			);
+			return;
+		}
+
+		const choice = await selectOne(
+			ctx,
+			"Delete provider",
+			providerIds.map((providerId) => {
+				const inline = describeProviderInline(providerId, config.providers?.[providerId]);
+				return {
+					value: providerId,
+					label: inline.label,
+					suffix: inline.suffix,
+					searchText: inline.searchText,
+				};
+			}),
+			{ initialIndex: Math.min(cursor, providerIds.length - 1) },
+		);
+		if (!choice) return;
+
+		const provider = config.providers[choice];
+		const confirmed = await ctx.ui.confirm("Delete provider?", describeProvider(choice, provider));
+		const selectedIndex = providerIds.indexOf(choice);
+		cursor = selectedIndex;
+		if (!confirmed) continue;
+
+		cursor = selectedIndex + 1;
+		delete config.providers[choice];
+
+		try {
+			saveModelsConfig(config);
+		} catch (error) {
+			ctx.ui.notify(`Could not write ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+
+		deletedAny = true;
+		ctx.ui.notify(`Deleted provider \"${choice}\" from ${MODELS_JSON_PATH}`, "info");
 	}
-
-	config.providers ||= {};
-	const providerIds = Object.keys(config.providers).sort((a, b) => a.localeCompare(b));
-	if (providerIds.length === 0) {
-		ctx.ui.notify(`No providers found in ${MODELS_JSON_PATH}`, "warning");
-		return;
-	}
-
-	const choice = await ctx.ui.select("Delete provider", providerIds);
-	if (!choice) return;
-
-	const provider = config.providers[choice];
-	const confirmed = await ctx.ui.confirm("Delete provider?", describeProvider(choice, provider));
-	if (!confirmed) return;
-
-	delete config.providers[choice];
-
-	try {
-		saveModelsConfig(config);
-	} catch (error) {
-		ctx.ui.notify(`Could not write ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
-		return;
-	}
-
-	ctx.ui.notify(`Deleted provider \"${choice}\" from ${MODELS_JSON_PATH}`, "info");
 }
 
 export default function betterCustomWizard(pi: ExtensionAPI) {
 	pi.registerCommand("better-custom", {
 		description: "Wizard for adding or deleting custom providers in ~/.pi/agent/models.json",
 		handler: async (_args, ctx) => {
-			const action = await ctx.ui.select("Better custom", ["Add provider", "Delete provider"]);
+			const action = await selectOne(ctx, "Better custom", ["Add provider", "Delete provider"]);
 			if (!action) return;
 			if (action === "Delete provider") {
 				await deleteProviderFlow(ctx);
 				return;
 			}
 
-			const providerStyleLabel = await ctx.ui.select("Provider style", [
+			const providerStyleLabel = await selectOne(ctx, "Provider style", [
 				"Anthropic-compatible",
 				"OpenAI-compatible",
 				"Ollama-compatible",
@@ -481,21 +655,21 @@ export default function betterCustomWizard(pi: ExtensionAPI) {
 			}
 
 			const providerIdSuggestion = suggestProviderId(normalizedEndpoint);
-			const providerIdInput = await ctx.ui.input(
-				`Provider id (blank = ${providerIdSuggestion})`,
+			const providerNameInput = await ctx.ui.input(
+				`Provider name (blank = ${providerIdSuggestion})`,
 				"e.g. custom-example-com",
 			);
-			if (providerIdInput === undefined) return;
-			const providerId = slugify(providerIdInput.trim() || providerIdSuggestion);
+			if (providerNameInput === undefined) return;
+			const providerId = slugify(providerNameInput.trim() || providerIdSuggestion);
 			if (!providerId) {
-				ctx.ui.notify("Provider id is required.", "error");
+				ctx.ui.notify("Provider name is required.", "error");
 				return;
 			}
 
 			if (BUILTIN_PROVIDER_IDS.has(providerId)) {
 				const ok = await ctx.ui.confirm(
 					"Override built-in provider?",
-					`\"${providerId}\" matches a built-in provider id. Saving this will override that provider in ~/.pi/agent/models.json. Continue?`,
+					`"${providerId}" matches a built-in provider id. Saving this will override that provider in ~/.pi/agent/models.json. Continue?`,
 				);
 				if (!ok) return;
 			}
@@ -513,7 +687,7 @@ export default function betterCustomWizard(pi: ExtensionAPI) {
 
 			let modelIds: string[] | null = null;
 			if (api === "openai-completions") {
-				const modelMode = await ctx.ui.select("Models", ["Auto probe from /models", "Add manually"]);
+				const modelMode = await selectOne(ctx, "Models", ["Auto probe from /models", "Add manually"]);
 				if (!modelMode) return;
 
 				if (modelMode === "Auto probe from /models") {
@@ -542,7 +716,7 @@ export default function betterCustomWizard(pi: ExtensionAPI) {
 
 			if (!modelIds || modelIds.length === 0) return;
 
-			const reasoningChoice = await ctx.ui.select("Reasoning", [
+			const reasoningChoice = await selectOne(ctx, "Reasoning", [
 				"Yes - set reasoning=true for all models",
 				"No - leave reasoning unset",
 			]);
@@ -561,7 +735,7 @@ export default function betterCustomWizard(pi: ExtensionAPI) {
 			if (config.providers[providerId]) {
 				const replace = await ctx.ui.confirm(
 					"Replace existing provider?",
-					`Provider \"${providerId}\" already exists in ${MODELS_JSON_PATH}. Replace it?`,
+					`Provider "${providerId}" already exists in ${MODELS_JSON_PATH}. Replace it?`,
 				);
 				if (!replace) return;
 			}
