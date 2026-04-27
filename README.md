@@ -21,7 +21,13 @@ A better way to add custom provider for Pi coding agnet
 
 ## Install
 
-Install directly from GitHub:
+From npm:
+
+```bash
+pi install npm:better-custom
+```
+
+From GitHub:
 
 ```bash
 pi install git:github.com/ratatulieoi/better-custom
