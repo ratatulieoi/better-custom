@@ -30,12 +30,6 @@ pi install npm:better-custom
 From GitHub:
 
 ```bash
-pi install git:github.com/ratatulieoi/better-custom
-```
-
-Or:
-
-```bash
 pi install https://github.com/ratatulieoi/better-custom
 ```
 
