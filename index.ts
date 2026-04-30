@@ -334,11 +334,24 @@ async function pickMany(
 ): Promise<string[] | null> {
 	return await ctx.ui.custom<string[] | null>((tui, theme, _kb, done) => {
 		let cursor = 0;
+		let query = "";
 		const selected = new Set<string>();
 		let cachedLines: string[] | undefined;
 		const maxVisible = 12;
 
+		function getVisibleItems() {
+			const lowerQuery = query.trim().toLowerCase();
+			if (!lowerQuery) return items;
+			return items.filter((item) => {
+				const haystack = `${item.label} ${item.value} ${item.description ?? ""}`.toLowerCase();
+				return haystack.includes(lowerQuery);
+			});
+		}
+
 		function refresh() {
+			const visibleItems = getVisibleItems();
+			if (visibleItems.length === 0) cursor = 0;
+			else if (cursor >= visibleItems.length) cursor = visibleItems.length - 1;
 			cachedLines = undefined;
 			tui.requestRender();
 		}
@@ -347,6 +360,7 @@ async function pickMany(
 			render(width: number) {
 				if (cachedLines) return cachedLines;
 
+				const visibleItems = getVisibleItems();
 				const safeWidth = Math.max(10, width);
 				const lines: string[] = [];
 				const add = (line = "") => lines.push(truncateToWidth(line, safeWidth));
@@ -354,32 +368,37 @@ async function pickMany(
 
 				add(border);
 				add(` ${theme.fg("accent", theme.bold(title))}`);
-				add(` ${theme.fg("muted", `${selected.size} selected`)}`);
+				add(` ${theme.fg("text", `Search: ${query || "-"}`)}`);
+				add(` ${theme.fg("muted", `${selected.size} selected • ${visibleItems.length}/${items.length} shown`)}`);
 				add();
 
-				const start = Math.max(0, Math.min(cursor - Math.floor(maxVisible / 2), Math.max(0, items.length - maxVisible)));
-				const end = Math.min(items.length, start + maxVisible);
+				if (visibleItems.length === 0) {
+					add(theme.fg("warning", " No matching models."));
+				} else {
+					const start = Math.max(0, Math.min(cursor - Math.floor(maxVisible / 2), Math.max(0, visibleItems.length - maxVisible)));
+					const end = Math.min(visibleItems.length, start + maxVisible);
 
-				for (let i = start; i < end; i++) {
-					const item = items[i];
-					const active = i === cursor;
-					const checked = selected.has(item.value);
-					const prefix = active ? theme.fg("accent", "> ") : "  ";
-					const box = checked ? theme.fg("success", "[x]") : theme.fg("muted", "[ ]");
-					const label = active ? theme.fg("accent", item.label) : theme.fg("text", item.label);
-					add(`${prefix}${box} ${label}`);
-					if (item.description) {
-						add(`     ${theme.fg("muted", item.description)}`);
+					for (let i = start; i < end; i++) {
+						const item = visibleItems[i];
+						const active = i === cursor;
+						const checked = selected.has(item.value);
+						const prefix = active ? theme.fg("accent", "> ") : "  ";
+						const box = checked ? theme.fg("success", "[x]") : theme.fg("muted", "[ ]");
+						const label = active ? theme.fg("accent", item.label) : theme.fg("text", item.label);
+						add(`${prefix}${box} ${label}`);
+						if (item.description) {
+							add(`     ${theme.fg("muted", item.description)}`);
+						}
+					}
+
+					if (visibleItems.length > maxVisible) {
+						add();
+						add(theme.fg("dim", ` ${start + 1}-${end} of ${visibleItems.length}`));
 					}
 				}
 
-				if (items.length > maxVisible) {
-					add();
-					add(theme.fg("dim", ` ${start + 1}-${end} of ${items.length}`));
-				}
-
 				add();
-				add(theme.fg("dim", " ↑↓ move (wraps) • space toggle • enter confirm • esc cancel"));
+				add(theme.fg("dim", " Type to search • ↑↓ move (wraps) • space toggle • enter confirm • backspace delete • esc cancel"));
 				if (selected.size === 0) {
 					add(theme.fg("warning", " Select at least one model before confirming."));
 				}
@@ -392,18 +411,21 @@ async function pickMany(
 				cachedLines = undefined;
 			},
 			handleInput(data: string) {
+				const visibleItems = getVisibleItems();
 				if (matchesKey(data, Key.up)) {
-					cursor = cursor === 0 ? items.length - 1 : cursor - 1;
+					if (visibleItems.length === 0) return;
+					cursor = cursor === 0 ? visibleItems.length - 1 : cursor - 1;
 					refresh();
 					return;
 				}
 				if (matchesKey(data, Key.down)) {
-					cursor = cursor === items.length - 1 ? 0 : cursor + 1;
+					if (visibleItems.length === 0) return;
+					cursor = cursor === visibleItems.length - 1 ? 0 : cursor + 1;
 					refresh();
 					return;
 				}
 				if (data === " ") {
-					const value = items[cursor]?.value;
+					const value = visibleItems[cursor]?.value;
 					if (!value) return;
 					if (selected.has(value)) selected.delete(value);
 					else selected.add(value);
@@ -416,6 +438,19 @@ async function pickMany(
 				}
 				if (matchesKey(data, Key.escape)) {
 					done(null);
+					return;
+				}
+				if (data === "\u007f" || data === "\b") {
+					if (query.length > 0) {
+						query = query.slice(0, -1);
+						refresh();
+					}
+					return;
+				}
+				if (data >= " " && data !== "\u001b" && data !== "\r" && data !== "\n") {
+					query += data;
+					cursor = 0;
+					refresh();
 				}
 			},
 		};

@@ -10,6 +10,14 @@
     "better-custom"
   ],
   "license": "MIT",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ratatulieoi/better-custom.git"
@@ -27,8 +35,16 @@
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*"
   },
+  "peerDependenciesMeta": {
+    "@mariozechner/pi-coding-agent": {
+      "optional": true
+    },
+    "@mariozechner/pi-tui": {
+      "optional": true
+    }
+  },
   "scripts": {
     "build": "echo 'No build step required'",
-    "check": "echo 'No build step required'"
+    "check": "node --check index.ts"
   }
 }
