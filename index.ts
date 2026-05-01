@@ -75,8 +75,12 @@ function saveModelsConfig(config: ModelsConfig) {
 	writeFileSync(MODELS_JSON_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
+function hasExplicitScheme(input: string): boolean {
+	return /^[a-z]+:\/\//i.test(input.trim());
+}
+
 function addDefaultScheme(input: string): string {
-	if (/^[a-z]+:\/\//i.test(input)) return input;
+	if (hasExplicitScheme(input)) return input;
 	const lower = input.toLowerCase();
 	const isLocal =
 		lower.startsWith("localhost") ||
@@ -460,37 +464,16 @@ async function pickMany(
 async function promptApiKey(
 	ctx: CommandContext,
 ): Promise<{ mode: ApiKeyMode; value?: string } | null> {
-	const choice = await selectOne(ctx, "API key", [
-		"Environment variable name",
-		"Literal API key",
-		"Shell command",
-		"None",
-	]);
+	const choice = await selectOne(ctx, "API key", ["API key", "None"]);
 	if (!choice) return null;
 
 	if (choice === "None") return { mode: "none" };
 
-	if (choice === "Environment variable name") {
-		const value = await ctx.ui.input("Environment variable name", "e.g. OPENAI_API_KEY");
-		if (value === undefined) return null;
-		const trimmed = value.trim();
-		if (!trimmed) return { mode: "none" };
-		return { mode: "env", value: trimmed };
-	}
-
-	if (choice === "Literal API key") {
-		const value = await ctx.ui.input("Literal API key", "saved directly in ~/.pi/agent/models.json");
-		if (value === undefined) return null;
-		const trimmed = value.trim();
-		if (!trimmed) return { mode: "none" };
-		return { mode: "literal", value: trimmed };
-	}
-
-	const value = await ctx.ui.input("Shell command", "e.g. op read 'op://vault/item/credential'");
+	const value = await ctx.ui.input("API key", "saved directly in ~/.pi/agent/models.json");
 	if (value === undefined) return null;
 	const trimmed = value.trim();
 	if (!trimmed) return { mode: "none" };
-	return { mode: "shell", value: trimmed };
+	return { mode: "literal", value: trimmed };
 }
 
 async function promptModelIdsOneByOne(
@@ -580,6 +563,95 @@ function describeProviderInline(providerId: string, provider: any): { label: str
 	};
 }
 
+function providerModelItems(provider: any): SelectItem[] {
+	const models = Array.isArray(provider?.models) ? provider.models : [];
+	return models
+		.map((model: any) => {
+			const id = typeof model === "string" ? model.trim() : typeof model?.id === "string" ? model.id.trim() : "";
+			if (!id) return null;
+
+			const details: string[] = [];
+			if (model && typeof model === "object") {
+				if (model.reasoning === true) details.push("reasoning");
+				if (typeof model.contextWindow === "number") details.push(`context ${model.contextWindow}`);
+				if (typeof model.maxTokens === "number") details.push(`max ${model.maxTokens}`);
+			}
+
+			return {
+				value: id,
+				label: id,
+				suffix: details.length > 0 ? ` • ${details.join(" • ")}` : "",
+				searchText: `${id} ${details.join(" ")}`,
+			};
+		})
+		.filter((item): item is SelectItem => item !== null);
+}
+
+function normalizeStoredEndpoint(provider: any): string {
+	const endpoint = typeof provider?.baseUrl === "string" ? provider.baseUrl.trim() : "";
+	if (!endpoint) return "";
+	const api: ProviderApi = provider?.api === "anthropic-messages" ? "anthropic-messages" : "openai-completions";
+	try {
+		return normalizeEndpoint(endpoint, api);
+	} catch {
+		return endpoint.replace(/\/+$/, "");
+	}
+}
+
+function findProvidersByEndpoint(config: ModelsConfig, endpoint: string): string[] {
+	return Object.entries(config.providers ?? {})
+		.filter(([, provider]) => normalizeStoredEndpoint(provider) === endpoint)
+		.map(([providerId]) => providerId)
+		.sort((a, b) => a.localeCompare(b));
+}
+
+async function listProviderFlow(ctx: CommandContext) {
+	let cursor = 0;
+
+	while (true) {
+		let config: ModelsConfig;
+		try {
+			config = loadModelsConfig();
+		} catch (error) {
+			ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+
+		config.providers ||= {};
+		const providerIds = Object.keys(config.providers).sort((a, b) => a.localeCompare(b));
+		if (providerIds.length === 0) {
+			ctx.ui.notify(`No providers found in ${MODELS_JSON_PATH}`, "warning");
+			return;
+		}
+
+		const choice = await selectOne(
+			ctx,
+			"List providers",
+			providerIds.map((providerId) => {
+				const inline = describeProviderInline(providerId, config.providers?.[providerId]);
+				return {
+					value: providerId,
+					label: inline.label,
+					suffix: inline.suffix,
+					searchText: inline.searchText,
+				};
+			}),
+			{ initialIndex: Math.min(cursor, providerIds.length - 1) },
+		);
+		if (!choice) return;
+
+		cursor = providerIds.indexOf(choice);
+		const provider = config.providers[choice];
+		const modelItems = providerModelItems(provider);
+		if (modelItems.length === 0) {
+			ctx.ui.notify(`Provider "${choice}" has no models.`, "warning");
+			continue;
+		}
+
+		await selectOne(ctx, `Models for ${choice}`, modelItems);
+	}
+}
+
 async function deleteProviderFlow(ctx: CommandContext) {
 	let cursor = 0;
 	let deletedAny = false;
@@ -644,16 +716,20 @@ export default function betterCustomWizard(pi: ExtensionAPI) {
 	pi.registerCommand("better-custom", {
 		description: "Wizard for adding or deleting custom providers in ~/.pi/agent/models.json",
 		handler: async (_args, ctx) => {
-			const action = await selectOne(ctx, "Better custom", ["Add provider", "Delete provider"]);
+			const action = await selectOne(ctx, "Better custom", ["Add provider", "List providers", "Delete provider"]);
 			if (!action) return;
+			if (action === "List providers") {
+				await listProviderFlow(ctx);
+				return;
+			}
 			if (action === "Delete provider") {
 				await deleteProviderFlow(ctx);
 				return;
 			}
 
 			const providerStyleLabel = await selectOne(ctx, "Provider style", [
-				"Anthropic-compatible",
 				"OpenAI-compatible",
+				"Anthropic-compatible",
 				"Ollama-compatible",
 			]);
 			if (!providerStyleLabel) return;
@@ -687,6 +763,23 @@ export default function betterCustomWizard(pi: ExtensionAPI) {
 			} catch (error) {
 				ctx.ui.notify(`Invalid endpoint: ${error instanceof Error ? error.message : String(error)}`, "error");
 				return;
+			}
+
+			let configForEndpointCheck: ModelsConfig;
+			try {
+				configForEndpointCheck = loadModelsConfig();
+			} catch (error) {
+				ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
+			}
+
+			const providersWithSameEndpoint = findProvidersByEndpoint(configForEndpointCheck, normalizedEndpoint);
+			if (providersWithSameEndpoint.length > 0) {
+				const ok = await ctx.ui.confirm(
+					"Endpoint already exists",
+					`This endpoint is already used by:\n${providersWithSameEndpoint.map((providerId) => `- ${providerId}`).join("\n")}\n\nAdd another provider with the same endpoint?`,
+				);
+				if (!ok) return;
 			}
 
 			const providerIdSuggestion = suggestProviderId(normalizedEndpoint);
@@ -736,8 +829,11 @@ export default function betterCustomWizard(pi: ExtensionAPI) {
 							modelIds = await pickMany(ctx, "Select models", probedModels);
 						}
 					} catch (error) {
+						const schemeHint = hasExplicitScheme(trimmedEndpointInput)
+							? ""
+							: "\n\nNo http:// or https:// was provided.";
 						ctx.ui.notify(
-							`Auto probe failed: ${error instanceof Error ? error.message : String(error)}. Switching to manual entry.`,
+							`Auto probe failed: ${error instanceof Error ? error.message : String(error)}.${schemeHint}\n\nSwitching to manual entry.`,
 							"warning",
 						);
 						modelIds = await promptModelIdsOneByOne(ctx, style, api);
