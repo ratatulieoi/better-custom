@@ -181,6 +181,7 @@ function serializeApiKey(mode: ApiKeyMode, value?: string, style?: ProviderStyle
 async function probeOpenAIModels(baseUrl: string, apiKeyMode: ApiKeyMode, apiKeyValue?: string): Promise<ProbeItem[]> {
 	const headers: Record<string, string> = {
 		accept: "application/json",
+		"accept-encoding": "identity",
 	};
 	const resolvedKey = resolveApiKeyForProbe(apiKeyMode, apiKeyValue);
 	if (resolvedKey) {
