@@ -76,6 +76,7 @@ Pick a provider, then choose:
   - Headers / endpoint override (per-model `baseUrl` and JSON `headers`)
   - Delete this model
 - Add models manually
+- Rename provider — change the provider name (key) in `models.json`
 
 Per-model edits change one field in place, so untouched fields (cost, headers,
 overrides) are preserved.

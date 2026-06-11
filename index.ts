@@ -834,6 +834,7 @@ async function editSingleProvider(ctx: CommandContext, providerId: string) {
 			{ value: "context", label: "Set context window (all models)", description: `Apply one contextWindow to all ${modelCount} model${modelCount === 1 ? "" : "s"}` },
 			{ value: "models", label: "Edit per model", description: `${modelCount} model${modelCount === 1 ? "" : "s"} — reasoning, vision, context, max tokens, headers, delete` },
 			{ value: "add", label: "Add models manually", description: "Type model ids to add" },
+			{ value: "rename", label: "Rename provider", description: "Change the provider name in models.json" },
 			{ value: "back", label: "Back", description: "Return to the provider list" },
 		]);
 		if (!action || action === "back") return;
@@ -846,8 +847,68 @@ async function editSingleProvider(ctx: CommandContext, providerId: string) {
 			await setProviderContextWindow(ctx, providerId);
 		} else if (action === "add") {
 			await addModelsToProvider(ctx, providerId);
+		} else if (action === "rename") {
+			// Reassign so the menu keeps editing the same provider under its new name.
+			const renamed = await renameProvider(ctx, providerId);
+			if (renamed) providerId = renamed;
 		}
 	}
+}
+
+// Rename a provider's key in models.json, preserving its config and original
+// position in the file. Returns the new id on success, or null if cancelled,
+// unchanged, or rejected. Only touches models.json — a currently-selected model
+// pinned to the old provider id must be reselected via /model afterwards.
+async function renameProvider(ctx: CommandContext, providerId: string): Promise<string | null> {
+	let config: ModelsConfig;
+	try {
+		config = loadModelsConfig();
+	} catch (error) {
+		ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return null;
+	}
+	config.providers ||= {};
+	if (!config.providers[providerId]) {
+		ctx.ui.notify(`Provider "${providerId}" no longer exists.`, "warning");
+		return null;
+	}
+
+	const input = await ctx.ui.input("Rename provider", `current: ${providerId}`);
+	if (input === undefined) return null;
+	// Slugify so names stay consistent with the Add flow.
+	const newId = slugify(input.trim());
+	if (!newId || newId === providerId) return null;
+
+	if (config.providers[newId]) {
+		ctx.ui.notify(`Provider "${newId}" already exists. Choose a different name.`, "warning");
+		return null;
+	}
+
+	if (BUILTIN_PROVIDER_IDS.has(newId)) {
+		const ok = await ctx.ui.confirm(
+			"Override built-in provider?",
+			`"${newId}" matches a built-in provider id. Saving this will override that provider in ~/.pi/agent/models.json. Continue?`,
+		);
+		if (!ok) return null;
+	}
+
+	// Rebuild key-by-key so the renamed entry keeps its position rather than
+	// jumping to the bottom (a naive delete + reassign would reorder it).
+	const rebuilt: Record<string, any> = {};
+	for (const [key, value] of Object.entries(config.providers)) {
+		rebuilt[key === providerId ? newId : key] = value;
+	}
+	config.providers = rebuilt;
+
+	try {
+		saveModelsConfig(config);
+	} catch (error) {
+		ctx.ui.notify(`Could not write ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return null;
+	}
+
+	ctx.ui.notify(`Renamed "${providerId}" → "${newId}".`, "info");
+	return newId;
 }
 
 // Apply a single contextWindow value to every model in the provider, preserving
