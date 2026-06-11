@@ -1,6 +1,6 @@
 {
   "name": "better-custom",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Pi extension package for adding and deleting custom providers through an interactive wizard.",
   "type": "module",
   "keywords": [

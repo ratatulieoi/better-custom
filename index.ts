@@ -8,6 +8,16 @@ import { dirname } from "node:path";
 type ProviderApi = "openai-completions" | "anthropic-messages";
 type ProviderStyle = "openai" | "anthropic" | "ollama";
 type ApiKeyMode = "env" | "literal" | "shell" | "none";
+// pi's reasoning ceilings. "off" means no reasoning; the rest are the levels a
+// model is allowed to use. See pi-ai getSupportedThinkingLevels.
+type ReasoningCeiling = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+const REASONING_LEVELS: ReasoningCeiling[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+// Per-model knobs the wizard can write. apiKey lives at provider scope, not here.
+type ModelOptions = {
+	reasoning: ReasoningCeiling;
+	vision: boolean;
+};
 
 type ModelsConfig = {
 	providers?: Record<string, any>;
@@ -174,7 +184,10 @@ function resolveApiKeyForProbe(mode: ApiKeyMode, storedValue?: string): string |
 function serializeApiKey(mode: ApiKeyMode, value?: string, style?: ProviderStyle): string | undefined {
 	if (mode === "none") return style === "ollama" ? "ollama" : "dummy";
 	if (!value) return undefined;
+	// pi resolves an apiKey by prefix: "!cmd" runs a shell command, "$VAR" reads an
+	// env var, anything else is a literal. See pi-ai resolve-config-value.
 	if (mode === "shell") return value.startsWith("!") ? value : `!${value}`;
+	if (mode === "env") return value.startsWith("$") ? value : `$${value}`;
 	return value;
 }
 
@@ -465,10 +478,30 @@ async function pickMany(
 async function promptApiKey(
 	ctx: CommandContext,
 ): Promise<{ mode: ApiKeyMode; value?: string } | null> {
-	const choice = await selectOne(ctx, "API key", ["API key", "None"]);
+	const choice = await selectOne(ctx, "API key", [
+		{ value: "literal", label: "Literal API key", description: "Stored verbatim in ~/.pi/agent/models.json" },
+		{ value: "env", label: "Environment variable", description: "Stored as $NAME, read from the environment at runtime" },
+		{ value: "shell", label: "Shell command", description: "Stored as !command, executed at runtime (stdout is the key)" },
+		{ value: "none", label: "None", description: "No key; a placeholder is written so the provider still loads" },
+	]);
 	if (!choice) return null;
+	if (choice === "none") return { mode: "none" };
 
-	if (choice === "None") return { mode: "none" };
+	if (choice === "env") {
+		const value = await ctx.ui.input("Environment variable name", "e.g. OPENAI_API_KEY");
+		if (value === undefined) return null;
+		const trimmed = value.trim().replace(/^\$/, "");
+		if (!trimmed) return { mode: "none" };
+		return { mode: "env", value: trimmed };
+	}
+
+	if (choice === "shell") {
+		const value = await ctx.ui.input("Shell command", "e.g. cat ~/.secrets/openai or pass show openai");
+		if (value === undefined) return null;
+		const trimmed = value.trim().replace(/^!/, "");
+		if (!trimmed) return { mode: "none" };
+		return { mode: "shell", value: trimmed };
+	}
 
 	const value = await ctx.ui.input("API key", "saved directly in ~/.pi/agent/models.json");
 	if (value === undefined) return null;
@@ -477,10 +510,76 @@ async function promptApiKey(
 	return { mode: "literal", value: trimmed };
 }
 
+function reasoningLabel(level: ReasoningCeiling): string {
+	if (level === "off") return "Off - no reasoning";
+	if (level === "xhigh") return "xhigh - maximum (only if the model supports it)";
+	return `${level} - cap reasoning at ${level}`;
+}
+
+// Prompts for a reasoning ceiling. Returns null if cancelled.
+async function promptReasoning(ctx: CommandContext, current?: ReasoningCeiling): Promise<ReasoningCeiling | null> {
+	const items: SelectItem[] = REASONING_LEVELS.map((level) => ({
+		value: level,
+		label: reasoningLabel(level),
+	}));
+	const initialIndex = current ? REASONING_LEVELS.indexOf(current) : 0;
+	const choice = await selectOne(ctx, "Reasoning", items, { initialIndex: Math.max(0, initialIndex) });
+	return (choice as ReasoningCeiling | null) ?? null;
+}
+
+// When a model is capped at xhigh, some providers name that level differently
+// (e.g. "max"). Offer an optional override for the provider-facing string.
+async function promptXhighProviderString(ctx: CommandContext, current?: string): Promise<string | undefined> {
+	const value = await ctx.ui.input(
+		"xhigh provider value (blank = xhigh)",
+		current && current !== "xhigh" ? `current: ${current}` : 'e.g. max (leave blank to send "xhigh")',
+	);
+	if (value === undefined) return undefined;
+	const trimmed = value.trim();
+	return trimmed || undefined;
+}
+
+async function promptVision(ctx: CommandContext, current?: boolean): Promise<boolean | null> {
+	const choice = await selectOne(ctx, "Image input (vision)", [
+		{ value: "yes", label: "Yes - send text + images", description: "Sets input: [text, image]" },
+		{ value: "no", label: "No - text only", description: "Sets input: [text]" },
+	], { initialIndex: current === false ? 1 : 0 });
+	if (!choice) return null;
+	return choice === "yes";
+}
+
+// Read the reasoning ceiling + vision flags already stored on a model entry,
+// mirroring pi's getSupportedThinkingLevels so edit defaults match reality.
+function readModelOptions(model: any): ModelOptions {
+	const vision = Array.isArray(model?.input) ? model.input.includes("image") : true;
+	if (!model || model.reasoning !== true) return { reasoning: "off", vision };
+
+	const map = model.thinkingLevelMap;
+	let ceiling: ReasoningCeiling = "high";
+	if (map && typeof map === "object") {
+		if (map.xhigh !== undefined && map.xhigh !== null) {
+			ceiling = "xhigh";
+		} else {
+			for (let i = REASONING_LEVELS.length - 1; i >= 1; i--) {
+				const level = REASONING_LEVELS[i];
+				if (level === "xhigh") continue;
+				if (map[level] === null) continue;
+				ceiling = level;
+				break;
+			}
+		}
+	}
+	return { reasoning: ceiling, vision };
+}
+
+function readXhighProviderString(model: any): string | undefined {
+	const v = model?.thinkingLevelMap?.xhigh;
+	return typeof v === "string" ? v : undefined;
+}
+
 async function promptModelIdsOneByOne(
 	ctx: CommandContext,
 	style: ProviderStyle,
-	api: ProviderApi,
 ): Promise<string[] | null> {
 	const modelIds: string[] = [];
 	const firstPlaceholder =
@@ -515,23 +614,55 @@ async function promptModelIdsOneByOne(
 	}
 }
 
+function buildModelEntry(id: string, opts: ModelOptions, providerStringOverride?: string): any {
+	const entry: any = {
+		id,
+		// Default to text+image so pi forwards images upstream. Without this,
+		// custom models default to text-only and images are silently dropped.
+		input: opts.vision ? ["text", "image"] : ["text"],
+	};
+
+	if (opts.reasoning === "off") return entry;
+
+	entry.reasoning = true;
+
+	// pi's getSupportedThinkingLevels: off/minimal/low/medium/high are on by
+	// default when reasoning is true; xhigh is available ONLY if explicitly
+	// mapped; any level set to null is removed. So we only need a map to (a)
+	// unlock xhigh, or (b) cap below high by nulling the higher levels.
+	const ceilingIndex = REASONING_LEVELS.indexOf(opts.reasoning);
+	const map: Record<string, string | null> = {};
+	for (const level of REASONING_LEVELS) {
+		if (level === "off") continue;
+		const index = REASONING_LEVELS.indexOf(level);
+		if (level === "xhigh") {
+			// xhigh is off unless explicitly mapped. Only enable it at the xhigh
+			// ceiling; below high it stays absent (no redundant null needed).
+			if (ceilingIndex >= index) map.xhigh = providerStringOverride?.trim() || "xhigh";
+		} else if (index > ceilingIndex) {
+			map[level] = null;
+		}
+	}
+
+	if (Object.keys(map).length > 0) entry.thinkingLevelMap = map;
+	return entry;
+}
+
 function buildProviderConfig(
 	style: ProviderStyle,
 	api: ProviderApi,
 	baseUrl: string,
 	apiKey: { mode: ApiKeyMode; value?: string },
 	modelIds: string[],
-	reasoning: boolean,
+	opts: ModelOptions,
+	providerStringOverride?: string,
 ) {
 	const serializedApiKey = serializeApiKey(apiKey.mode, apiKey.value, style);
 	const config: any = {
 		baseUrl,
 		api,
 		...(serializedApiKey ? { apiKey: serializedApiKey } : {}),
-		models: modelIds.map((id) => ({
-			id,
-			...(reasoning ? { reasoning: true } : {}),
-		})),
+		models: modelIds.map((id) => buildModelEntry(id, opts, providerStringOverride)),
 	};
 
 	if (style === "ollama") {
@@ -573,7 +704,11 @@ function providerModelItems(provider: any): SelectItem[] {
 
 			const details: string[] = [];
 			if (model && typeof model === "object") {
-				if (model.reasoning === true) details.push("reasoning");
+				if (model.reasoning === true) {
+					const opts = readModelOptions(model);
+					details.push(`reasoning:${opts.reasoning}`);
+				}
+				if (Array.isArray(model.input) && model.input.includes("image")) details.push("vision");
 				if (typeof model.contextWindow === "number") details.push(`context ${model.contextWindow}`);
 				if (typeof model.maxTokens === "number") details.push(`max ${model.maxTokens}`);
 			}
@@ -606,7 +741,7 @@ function findProvidersByEndpoint(config: ModelsConfig, endpoint: string): string
 		.sort((a, b) => a.localeCompare(b));
 }
 
-async function listProviderFlow(ctx: CommandContext) {
+async function editProviderFlow(ctx: CommandContext) {
 	let cursor = 0;
 
 	while (true) {
@@ -627,7 +762,7 @@ async function listProviderFlow(ctx: CommandContext) {
 
 		const choice = await selectOne(
 			ctx,
-			"List providers",
+			"Edit provider",
 			providerIds.map((providerId) => {
 				const inline = describeProviderInline(providerId, config.providers?.[providerId]);
 				return {
@@ -642,15 +777,225 @@ async function listProviderFlow(ctx: CommandContext) {
 		if (!choice) return;
 
 		cursor = providerIds.indexOf(choice);
-		const provider = config.providers[choice];
-		const modelItems = providerModelItems(provider);
-		if (modelItems.length === 0) {
-			ctx.ui.notify(`Provider "${choice}" has no models.`, "warning");
-			continue;
+		await editSingleProvider(ctx, choice);
+	}
+}
+
+// Per-provider action menu. Returns when the user backs out to the provider list.
+async function editSingleProvider(ctx: CommandContext, providerId: string) {
+	while (true) {
+		let config: ModelsConfig;
+		try {
+			config = loadModelsConfig();
+		} catch (error) {
+			ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+		const provider = config.providers?.[providerId];
+		if (!provider) {
+			ctx.ui.notify(`Provider "${providerId}" no longer exists.`, "warning");
+			return;
 		}
 
-		await selectOne(ctx, `Models for ${choice}`, modelItems);
+		const modelCount = Array.isArray(provider.models) ? provider.models.length : 0;
+		const action = await selectOne(ctx, `Edit ${providerId}`, [
+			{ value: "models", label: "Edit a model", description: `${modelCount} model${modelCount === 1 ? "" : "s"} — set reasoning / vision` },
+			{ value: "probe", label: "Re-probe for new models", description: "Query /models again and add ones not already configured" },
+			{ value: "add", label: "Add models manually", description: "Type model ids to add" },
+			{ value: "back", label: "Back", description: "Return to the provider list" },
+		]);
+		if (!action || action === "back") return;
+
+		if (action === "models") {
+			await editProviderModels(ctx, providerId);
+		} else if (action === "probe") {
+			await reprobeProvider(ctx, providerId);
+		} else if (action === "add") {
+			await addModelsToProvider(ctx, providerId);
+		}
 	}
+}
+
+// Load config, hand the provider to a mutator, and save if it returns true.
+async function mutateProvider(
+	ctx: CommandContext,
+	providerId: string,
+	mutate: (provider: any) => boolean | Promise<boolean>,
+): Promise<boolean> {
+	let config: ModelsConfig;
+	try {
+		config = loadModelsConfig();
+	} catch (error) {
+		ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return false;
+	}
+	const provider = config.providers?.[providerId];
+	if (!provider) {
+		ctx.ui.notify(`Provider "${providerId}" no longer exists.`, "warning");
+		return false;
+	}
+
+	const changed = await mutate(provider);
+	if (!changed) return false;
+
+	try {
+		saveModelsConfig(config);
+	} catch (error) {
+		ctx.ui.notify(`Could not write ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return false;
+	}
+	return true;
+}
+
+// Pick a model, then set its reasoning ceiling and vision flag in place.
+async function editProviderModels(ctx: CommandContext, providerId: string) {
+	let cursor = 0;
+	while (true) {
+		let provider: any;
+		try {
+			provider = loadModelsConfig().providers?.[providerId];
+		} catch (error) {
+			ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+		const modelItems = providerModelItems(provider);
+		if (modelItems.length === 0) {
+			ctx.ui.notify(`Provider "${providerId}" has no models.`, "warning");
+			return;
+		}
+
+		const choice = await selectOne(ctx, `Edit model in ${providerId}`, modelItems, {
+			initialIndex: Math.min(cursor, modelItems.length - 1),
+		});
+		if (!choice) return;
+		cursor = modelItems.findIndex((item) => item.value === choice);
+
+		const current = readModelOptions(findModel(provider, choice));
+		const reasoning = await promptReasoning(ctx, current.reasoning);
+		if (reasoning === null) continue;
+
+		let xhighProviderString: string | undefined;
+		if (reasoning === "xhigh") {
+			xhighProviderString = await promptXhighProviderString(ctx, readXhighProviderString(findModel(provider, choice)));
+		}
+
+		const vision = await promptVision(ctx, current.vision);
+		if (vision === null) continue;
+
+		const saved = await mutateProvider(ctx, providerId, (p) => {
+			const models = Array.isArray(p.models) ? p.models : [];
+			const index = models.findIndex((m: any) => modelIdOf(m) === choice);
+			if (index === -1) return false;
+			models[index] = buildModelEntry(choice, { reasoning, vision }, xhighProviderString);
+			p.models = models;
+			return true;
+		});
+		if (saved) ctx.ui.notify(`Updated "${choice}".`, "info");
+	}
+}
+
+function modelIdOf(model: any): string {
+	return typeof model === "string" ? model.trim() : typeof model?.id === "string" ? model.id.trim() : "";
+}
+
+function findModel(provider: any, id: string): any {
+	const models = Array.isArray(provider?.models) ? provider.models : [];
+	return models.find((m: any) => modelIdOf(m) === id);
+}
+
+// Resolve a stored provider's apiKey reference back into mode+value so we can
+// reuse it for probing. Anything other than $VAR or !cmd is treated as literal.
+function apiKeyFromProvider(provider: any): { mode: ApiKeyMode; value?: string } {
+	const raw = typeof provider?.apiKey === "string" ? provider.apiKey : "";
+	if (!raw || raw === "dummy" || raw === "ollama") return { mode: "none" };
+	if (raw.startsWith("!")) return { mode: "shell", value: raw.slice(1) };
+	if (raw.startsWith("$")) return { mode: "env", value: raw.slice(1) };
+	return { mode: "literal", value: raw };
+}
+
+async function addModelEntriesToProvider(ctx: CommandContext, providerId: string, ids: string[]) {
+	const existing = new Set<string>();
+	try {
+		const provider = loadModelsConfig().providers?.[providerId];
+		for (const m of Array.isArray(provider?.models) ? provider.models : []) existing.add(modelIdOf(m));
+	} catch {
+		// fall through; mutateProvider re-reads and reports errors
+	}
+	const fresh = dedupe(ids).filter((id) => id && !existing.has(id));
+	if (fresh.length === 0) {
+		ctx.ui.notify("Nothing to add — all selected models already exist.", "info");
+		return;
+	}
+
+	const reasoning = await promptReasoning(ctx);
+	if (reasoning === null) return;
+	let xhighProviderString: string | undefined;
+	if (reasoning === "xhigh") xhighProviderString = await promptXhighProviderString(ctx);
+	const vision = await promptVision(ctx);
+	if (vision === null) return;
+
+	const saved = await mutateProvider(ctx, providerId, (p) => {
+		const models = Array.isArray(p.models) ? p.models : [];
+		for (const id of fresh) models.push(buildModelEntry(id, { reasoning, vision }, xhighProviderString));
+		p.models = models;
+		return true;
+	});
+	if (saved) ctx.ui.notify(`Added ${fresh.length} model${fresh.length === 1 ? "" : "s"} to "${providerId}".`, "info");
+}
+
+async function reprobeProvider(ctx: CommandContext, providerId: string) {
+	let provider: any;
+	try {
+		provider = loadModelsConfig().providers?.[providerId];
+	} catch (error) {
+		ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return;
+	}
+	if (provider?.api === "anthropic-messages") {
+		ctx.ui.notify("Anthropic-style endpoints don't expose /models. Use 'Add models manually'.", "warning");
+		return;
+	}
+	const baseUrl = typeof provider?.baseUrl === "string" ? provider.baseUrl : "";
+	if (!baseUrl) {
+		ctx.ui.notify(`Provider "${providerId}" has no baseUrl to probe.`, "error");
+		return;
+	}
+
+	const apiKey = apiKeyFromProvider(provider);
+	let probed: ProbeItem[];
+	try {
+		ctx.ui.notify(`Probing ${buildProbeUrl(baseUrl)} ...`, "info");
+		probed = await probeOpenAIModels(baseUrl, apiKey.mode, apiKey.value);
+	} catch (error) {
+		ctx.ui.notify(`Probe failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return;
+	}
+
+	const existing = new Set((Array.isArray(provider.models) ? provider.models : []).map(modelIdOf));
+	const novel = probed.filter((item) => !existing.has(item.value));
+	if (novel.length === 0) {
+		ctx.ui.notify("No new models — everything the endpoint returned is already configured.", "info");
+		return;
+	}
+
+	const picked = await pickMany(ctx, `New models for ${providerId}`, novel);
+	if (!picked || picked.length === 0) return;
+	await addModelEntriesToProvider(ctx, providerId, picked);
+}
+
+async function addModelsToProvider(ctx: CommandContext, providerId: string) {
+	let provider: any;
+	try {
+		provider = loadModelsConfig().providers?.[providerId];
+	} catch (error) {
+		ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return;
+	}
+	const style: ProviderStyle =
+		provider?.api === "anthropic-messages" ? "anthropic" : provider?.compat ? "ollama" : "openai";
+	const ids = await promptModelIdsOneByOne(ctx, style);
+	if (!ids || ids.length === 0) return;
+	await addModelEntriesToProvider(ctx, providerId, ids);
 }
 
 async function deleteProviderFlow(ctx: CommandContext) {
@@ -713,176 +1058,226 @@ async function deleteProviderFlow(ctx: CommandContext) {
 	}
 }
 
+async function promptProviderStyle(
+	ctx: CommandContext,
+): Promise<{ style: ProviderStyle; api: ProviderApi } | null> {
+	const providerStyleLabel = await selectOne(ctx, "Provider style", [
+		"OpenAI-compatible",
+		"Anthropic-compatible",
+		"Ollama-compatible",
+	]);
+	if (!providerStyleLabel) return null;
+
+	const style: ProviderStyle =
+		providerStyleLabel === "Anthropic-compatible"
+			? "anthropic"
+			: providerStyleLabel === "Ollama-compatible"
+				? "ollama"
+				: "openai";
+	const api: ProviderApi = style === "anthropic" ? "anthropic-messages" : "openai-completions";
+	return { style, api };
+}
+
+async function promptEndpoint(
+	ctx: CommandContext,
+	style: ProviderStyle,
+	api: ProviderApi,
+): Promise<{ normalized: string; raw: string } | null> {
+	const endpointInput = await ctx.ui.input(
+		"Endpoint",
+		style === "anthropic"
+			? "e.g. https://api.anthropic-proxy.com/v1"
+			: style === "ollama"
+				? "e.g. http://localhost:11434/v1"
+				: "e.g. https://api.example.com/v1 or http://localhost:11434/v1",
+	);
+	if (endpointInput === undefined) return null;
+	const raw = endpointInput.trim();
+	if (!raw) {
+		ctx.ui.notify("Endpoint is required.", "error");
+		return null;
+	}
+
+	try {
+		return { normalized: normalizeEndpoint(raw, api), raw };
+	} catch (error) {
+		ctx.ui.notify(`Invalid endpoint: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return null;
+	}
+}
+
+async function confirmEndpointReuse(ctx: CommandContext, normalizedEndpoint: string): Promise<boolean> {
+	let config: ModelsConfig;
+	try {
+		config = loadModelsConfig();
+	} catch (error) {
+		ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return false;
+	}
+
+	const providersWithSameEndpoint = findProvidersByEndpoint(config, normalizedEndpoint);
+	if (providersWithSameEndpoint.length === 0) return true;
+
+	return ctx.ui.confirm(
+		"Endpoint already exists",
+		`This endpoint is already used by:\n${providersWithSameEndpoint.map((id) => `- ${id}`).join("\n")}\n\nAdd another provider with the same endpoint?`,
+	);
+}
+
+async function promptProviderId(ctx: CommandContext, normalizedEndpoint: string): Promise<string | null> {
+	const providerIdSuggestion = suggestProviderId(normalizedEndpoint);
+	const providerNameInput = await ctx.ui.input(
+		`Provider name (blank = ${providerIdSuggestion})`,
+		"e.g. custom-example-com",
+	);
+	if (providerNameInput === undefined) return null;
+	const providerId = slugify(providerNameInput.trim() || providerIdSuggestion);
+	if (!providerId) {
+		ctx.ui.notify("Provider name is required.", "error");
+		return null;
+	}
+
+	if (BUILTIN_PROVIDER_IDS.has(providerId)) {
+		const ok = await ctx.ui.confirm(
+			"Override built-in provider?",
+			`"${providerId}" matches a built-in provider id. Saving this will override that provider in ~/.pi/agent/models.json. Continue?`,
+		);
+		if (!ok) return null;
+	}
+	return providerId;
+}
+
+async function persistProvider(ctx: CommandContext, providerId: string, providerConfig: any): Promise<boolean> {
+	let config: ModelsConfig;
+	try {
+		config = loadModelsConfig();
+	} catch (error) {
+		ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return false;
+	}
+
+	config.providers ||= {};
+	if (config.providers[providerId]) {
+		const replace = await ctx.ui.confirm(
+			"Replace existing provider?",
+			`Provider "${providerId}" already exists in ${MODELS_JSON_PATH}. Replace it?`,
+		);
+		if (!replace) return false;
+	}
+
+	config.providers[providerId] = providerConfig;
+	try {
+		saveModelsConfig(config);
+	} catch (error) {
+		ctx.ui.notify(`Could not write ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return false;
+	}
+	return true;
+}
+
+async function addProviderFlow(ctx: CommandContext) {
+	const styleChoice = await promptProviderStyle(ctx);
+	if (!styleChoice) return;
+	const { style, api } = styleChoice;
+
+	const endpoint = await promptEndpoint(ctx, style, api);
+	if (!endpoint) return;
+	if (!(await confirmEndpointReuse(ctx, endpoint.normalized))) return;
+
+	const providerId = await promptProviderId(ctx, endpoint.normalized);
+	if (!providerId) return;
+
+	const apiKey = await promptApiKey(ctx);
+	if (!apiKey) return;
+	if (apiKey.mode === "none") {
+		ctx.ui.notify(
+			style === "ollama"
+				? 'No API key selected. Using "ollama" automatically in models.json.'
+				: 'No API key selected. Using "dummy" automatically in models.json.',
+			"info",
+		);
+	}
+
+	const modelIds = await collectModelIds(ctx, style, api, apiKey, endpoint.normalized, endpoint.raw);
+	if (!modelIds || modelIds.length === 0) return;
+
+	const reasoning = await promptReasoning(ctx);
+	if (reasoning === null) return;
+
+	let xhighProviderString: string | undefined;
+	if (reasoning === "xhigh") {
+		xhighProviderString = await promptXhighProviderString(ctx);
+	}
+
+	const vision = await promptVision(ctx);
+	if (vision === null) return;
+
+	const providerConfig = buildProviderConfig(
+		style,
+		api,
+		endpoint.normalized,
+		apiKey,
+		dedupe(modelIds),
+		{ reasoning, vision },
+		xhighProviderString,
+	);
+	if (!(await persistProvider(ctx, providerId, providerConfig))) return;
+
+	ctx.ui.notify(`Saved provider \"${providerId}\" to ${MODELS_JSON_PATH}`, "info");
+	ctx.ui.notify("Open /model to use your new provider.", "info");
+}
+
+async function collectModelIds(
+	ctx: CommandContext,
+	style: ProviderStyle,
+	api: ProviderApi,
+	apiKey: { mode: ApiKeyMode; value?: string },
+	normalizedEndpoint: string,
+	trimmedEndpointInput: string,
+): Promise<string[] | null> {
+	if (api !== "openai-completions") {
+		return promptModelIdsOneByOne(ctx, style);
+	}
+
+	const modelMode = await selectOne(ctx, "Models", ["Auto probe from /models", "Add manually"]);
+	if (!modelMode) return null;
+	if (modelMode !== "Auto probe from /models") {
+		return promptModelIdsOneByOne(ctx, style);
+	}
+
+	try {
+		ctx.ui.notify(`Probing ${buildProbeUrl(normalizedEndpoint)} ...`, "info");
+		const probedModels = await probeOpenAIModels(normalizedEndpoint, apiKey.mode, apiKey.value);
+		if (probedModels.length === 0) {
+			ctx.ui.notify("Probe succeeded but returned no models. Switching to manual entry.", "warning");
+			return promptModelIdsOneByOne(ctx, style);
+		}
+		return pickMany(ctx, "Select models", probedModels);
+	} catch (error) {
+		const schemeHint = hasExplicitScheme(trimmedEndpointInput) ? "" : "\n\nNo http:// or https:// was provided.";
+		ctx.ui.notify(
+			`Auto probe failed: ${error instanceof Error ? error.message : String(error)}.${schemeHint}\n\nSwitching to manual entry.`,
+			"warning",
+		);
+		return promptModelIdsOneByOne(ctx, style);
+	}
+}
+
 export default function betterCustomWizard(pi: ExtensionAPI) {
 	pi.registerCommand("better-custom", {
-		description: "Wizard for adding or deleting custom providers in ~/.pi/agent/models.json",
+		description: "Wizard for adding, editing, or deleting custom providers in ~/.pi/agent/models.json",
 		handler: async (_args, ctx) => {
-			const action = await selectOne(ctx, "Better custom", ["Add provider", "List providers", "Delete provider"]);
+			const action = await selectOne(ctx, "Better custom", ["Add provider", "Edit provider", "Delete provider"]);
 			if (!action) return;
-			if (action === "List providers") {
-				await listProviderFlow(ctx);
+			if (action === "Edit provider") {
+				await editProviderFlow(ctx);
 				return;
 			}
 			if (action === "Delete provider") {
 				await deleteProviderFlow(ctx);
 				return;
 			}
-
-			const providerStyleLabel = await selectOne(ctx, "Provider style", [
-				"OpenAI-compatible",
-				"Anthropic-compatible",
-				"Ollama-compatible",
-			]);
-			if (!providerStyleLabel) return;
-
-			const style: ProviderStyle =
-				providerStyleLabel === "Anthropic-compatible"
-					? "anthropic"
-					: providerStyleLabel === "Ollama-compatible"
-						? "ollama"
-						: "openai";
-			const api: ProviderApi = style === "anthropic" ? "anthropic-messages" : "openai-completions";
-
-			const endpointInput = await ctx.ui.input(
-				"Endpoint",
-				style === "anthropic"
-					? "e.g. https://api.anthropic-proxy.com/v1"
-					: style === "ollama"
-						? "e.g. http://localhost:11434/v1"
-						: "e.g. https://api.example.com/v1 or http://localhost:11434/v1",
-			);
-			if (endpointInput === undefined) return;
-			const trimmedEndpointInput = endpointInput.trim();
-			if (!trimmedEndpointInput) {
-				ctx.ui.notify("Endpoint is required.", "error");
-				return;
-			}
-
-			let normalizedEndpoint: string;
-			try {
-				normalizedEndpoint = normalizeEndpoint(trimmedEndpointInput, api);
-			} catch (error) {
-				ctx.ui.notify(`Invalid endpoint: ${error instanceof Error ? error.message : String(error)}`, "error");
-				return;
-			}
-
-			let configForEndpointCheck: ModelsConfig;
-			try {
-				configForEndpointCheck = loadModelsConfig();
-			} catch (error) {
-				ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
-				return;
-			}
-
-			const providersWithSameEndpoint = findProvidersByEndpoint(configForEndpointCheck, normalizedEndpoint);
-			if (providersWithSameEndpoint.length > 0) {
-				const ok = await ctx.ui.confirm(
-					"Endpoint already exists",
-					`This endpoint is already used by:\n${providersWithSameEndpoint.map((providerId) => `- ${providerId}`).join("\n")}\n\nAdd another provider with the same endpoint?`,
-				);
-				if (!ok) return;
-			}
-
-			const providerIdSuggestion = suggestProviderId(normalizedEndpoint);
-			const providerNameInput = await ctx.ui.input(
-				`Provider name (blank = ${providerIdSuggestion})`,
-				"e.g. custom-example-com",
-			);
-			if (providerNameInput === undefined) return;
-			const providerId = slugify(providerNameInput.trim() || providerIdSuggestion);
-			if (!providerId) {
-				ctx.ui.notify("Provider name is required.", "error");
-				return;
-			}
-
-			if (BUILTIN_PROVIDER_IDS.has(providerId)) {
-				const ok = await ctx.ui.confirm(
-					"Override built-in provider?",
-					`"${providerId}" matches a built-in provider id. Saving this will override that provider in ~/.pi/agent/models.json. Continue?`,
-				);
-				if (!ok) return;
-			}
-
-			const apiKey = await promptApiKey(ctx);
-			if (!apiKey) return;
-			if (apiKey.mode === "none") {
-				ctx.ui.notify(
-					style === "ollama"
-						? 'No API key selected. Using "ollama" automatically in models.json.'
-						: 'No API key selected. Using "dummy" automatically in models.json.',
-					"info",
-				);
-			}
-
-			let modelIds: string[] | null = null;
-			if (api === "openai-completions") {
-				const modelMode = await selectOne(ctx, "Models", ["Auto probe from /models", "Add manually"]);
-				if (!modelMode) return;
-
-				if (modelMode === "Auto probe from /models") {
-					try {
-						ctx.ui.notify(`Probing ${buildProbeUrl(normalizedEndpoint)} ...`, "info");
-						const probedModels = await probeOpenAIModels(normalizedEndpoint, apiKey.mode, apiKey.value);
-						if (probedModels.length === 0) {
-							ctx.ui.notify("Probe succeeded but returned no models. Switching to manual entry.", "warning");
-							modelIds = await promptModelIdsOneByOne(ctx, style, api);
-						} else {
-							modelIds = await pickMany(ctx, "Select models", probedModels);
-						}
-					} catch (error) {
-						const schemeHint = hasExplicitScheme(trimmedEndpointInput)
-							? ""
-							: "\n\nNo http:// or https:// was provided.";
-						ctx.ui.notify(
-							`Auto probe failed: ${error instanceof Error ? error.message : String(error)}.${schemeHint}\n\nSwitching to manual entry.`,
-							"warning",
-						);
-						modelIds = await promptModelIdsOneByOne(ctx, style, api);
-					}
-				} else {
-					modelIds = await promptModelIdsOneByOne(ctx, style, api);
-				}
-			} else {
-				modelIds = await promptModelIdsOneByOne(ctx, style, api);
-			}
-
-			if (!modelIds || modelIds.length === 0) return;
-
-			const reasoningChoice = await selectOne(ctx, "Reasoning", [
-				"Yes - set reasoning=true for all models",
-				"No - leave reasoning unset",
-			]);
-			if (!reasoningChoice) return;
-			const reasoning = reasoningChoice.startsWith("Yes");
-
-			let config: ModelsConfig;
-			try {
-				config = loadModelsConfig();
-			} catch (error) {
-				ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
-				return;
-			}
-
-			config.providers ||= {};
-			if (config.providers[providerId]) {
-				const replace = await ctx.ui.confirm(
-					"Replace existing provider?",
-					`Provider "${providerId}" already exists in ${MODELS_JSON_PATH}. Replace it?`,
-				);
-				if (!replace) return;
-			}
-
-			config.providers[providerId] = buildProviderConfig(style, api, normalizedEndpoint, apiKey, dedupe(modelIds), reasoning);
-
-			try {
-				saveModelsConfig(config);
-			} catch (error) {
-				ctx.ui.notify(`Could not write ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
-				return;
-			}
-
-			ctx.ui.notify(`Saved provider \"${providerId}\" to ${MODELS_JSON_PATH}`, "info");
-			ctx.ui.notify("Open /model to use your new provider.", "info");
+			await addProviderFlow(ctx);
 		},
 	});
 }
