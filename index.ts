@@ -1,5 +1,5 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -17,6 +17,7 @@ const REASONING_LEVELS: ReasoningCeiling[] = ["off", "minimal", "low", "medium",
 type ModelOptions = {
 	reasoning: ReasoningCeiling;
 	vision: boolean;
+	contextWindow?: number;
 };
 
 type ModelsConfig = {
@@ -479,29 +480,11 @@ async function promptApiKey(
 	ctx: CommandContext,
 ): Promise<{ mode: ApiKeyMode; value?: string } | null> {
 	const choice = await selectOne(ctx, "API key", [
-		{ value: "literal", label: "Literal API key", description: "Stored verbatim in ~/.pi/agent/models.json" },
-		{ value: "env", label: "Environment variable", description: "Stored as $NAME, read from the environment at runtime" },
-		{ value: "shell", label: "Shell command", description: "Stored as !command, executed at runtime (stdout is the key)" },
+		{ value: "literal", label: "API key", description: "Stored verbatim in ~/.pi/agent/models.json" },
 		{ value: "none", label: "None", description: "No key; a placeholder is written so the provider still loads" },
 	]);
 	if (!choice) return null;
 	if (choice === "none") return { mode: "none" };
-
-	if (choice === "env") {
-		const value = await ctx.ui.input("Environment variable name", "e.g. OPENAI_API_KEY");
-		if (value === undefined) return null;
-		const trimmed = value.trim().replace(/^\$/, "");
-		if (!trimmed) return { mode: "none" };
-		return { mode: "env", value: trimmed };
-	}
-
-	if (choice === "shell") {
-		const value = await ctx.ui.input("Shell command", "e.g. cat ~/.secrets/openai or pass show openai");
-		if (value === undefined) return null;
-		const trimmed = value.trim().replace(/^!/, "");
-		if (!trimmed) return { mode: "none" };
-		return { mode: "shell", value: trimmed };
-	}
 
 	const value = await ctx.ui.input("API key", "saved directly in ~/.pi/agent/models.json");
 	if (value === undefined) return null;
@@ -548,11 +531,50 @@ async function promptVision(ctx: CommandContext, current?: boolean): Promise<boo
 	return choice === "yes";
 }
 
+// Prompts for a context window size in tokens. Returns:
+//   number  -> set/replace contextWindow
+//   0       -> clear contextWindow (user typed 0)
+//   null    -> cancelled, leave unchanged
+async function promptContextWindow(ctx: CommandContext, current?: number): Promise<number | null> {
+	const value = await ctx.ui.input(
+		"Context window (tokens)",
+		current ? `current: ${current} (blank = keep, 0 = clear)` : "e.g. 128000 (blank = unset)",
+	);
+	if (value === undefined) return null;
+	const trimmed = value.trim();
+	if (!trimmed) return null;
+	const parsed = Number.parseInt(trimmed.replace(/[_,]/g, ""), 10);
+	if (!Number.isFinite(parsed) || parsed < 0) {
+		ctx.ui.notify("Enter a whole number of tokens (0 to clear).", "warning");
+		return null;
+	}
+	return parsed;
+}
+
+// Prompts for max output tokens. Same return contract as promptContextWindow:
+// number to set, 0 to clear, null to leave unchanged.
+async function promptMaxTokens(ctx: CommandContext, current?: number): Promise<number | null> {
+	const value = await ctx.ui.input(
+		"Max output tokens",
+		current ? `current: ${current} (blank = keep, 0 = clear)` : "e.g. 8192 (blank = unset)",
+	);
+	if (value === undefined) return null;
+	const trimmed = value.trim();
+	if (!trimmed) return null;
+	const parsed = Number.parseInt(trimmed.replace(/[_,]/g, ""), 10);
+	if (!Number.isFinite(parsed) || parsed < 0) {
+		ctx.ui.notify("Enter a whole number of tokens (0 to clear).", "warning");
+		return null;
+	}
+	return parsed;
+}
+
 // Read the reasoning ceiling + vision flags already stored on a model entry,
 // mirroring pi's getSupportedThinkingLevels so edit defaults match reality.
 function readModelOptions(model: any): ModelOptions {
 	const vision = Array.isArray(model?.input) ? model.input.includes("image") : true;
-	if (!model || model.reasoning !== true) return { reasoning: "off", vision };
+	const contextWindow = typeof model?.contextWindow === "number" ? model.contextWindow : undefined;
+	if (!model || model.reasoning !== true) return { reasoning: "off", vision, contextWindow };
 
 	const map = model.thinkingLevelMap;
 	let ceiling: ReasoningCeiling = "high";
@@ -569,7 +591,7 @@ function readModelOptions(model: any): ModelOptions {
 			}
 		}
 	}
-	return { reasoning: ceiling, vision };
+	return { reasoning: ceiling, vision, contextWindow };
 }
 
 function readXhighProviderString(model: any): string | undefined {
@@ -614,6 +636,33 @@ async function promptModelIdsOneByOne(
 	}
 }
 
+// Apply a reasoning ceiling to an entry in place, preserving other fields.
+// Mirrors pi's getSupportedThinkingLevels: off/minimal/low/medium/high are on
+// by default when reasoning is true; xhigh is available ONLY if explicitly
+// mapped; any level set to null is removed. So we only need a map to (a) unlock
+// xhigh, or (b) cap below high by nulling the higher levels.
+function applyReasoning(entry: any, ceiling: ReasoningCeiling, providerStringOverride?: string) {
+	if (ceiling === "off") {
+		delete entry.reasoning;
+		delete entry.thinkingLevelMap;
+		return;
+	}
+	entry.reasoning = true;
+	const ceilingIndex = REASONING_LEVELS.indexOf(ceiling);
+	const map: Record<string, string | null> = {};
+	for (const level of REASONING_LEVELS) {
+		if (level === "off") continue;
+		const index = REASONING_LEVELS.indexOf(level);
+		if (level === "xhigh") {
+			if (ceilingIndex >= index) map.xhigh = providerStringOverride?.trim() || "xhigh";
+		} else if (index > ceilingIndex) {
+			map[level] = null;
+		}
+	}
+	if (Object.keys(map).length > 0) entry.thinkingLevelMap = map;
+	else delete entry.thinkingLevelMap;
+}
+
 function buildModelEntry(id: string, opts: ModelOptions, providerStringOverride?: string): any {
 	const entry: any = {
 		id,
@@ -622,29 +671,11 @@ function buildModelEntry(id: string, opts: ModelOptions, providerStringOverride?
 		input: opts.vision ? ["text", "image"] : ["text"],
 	};
 
-	if (opts.reasoning === "off") return entry;
-
-	entry.reasoning = true;
-
-	// pi's getSupportedThinkingLevels: off/minimal/low/medium/high are on by
-	// default when reasoning is true; xhigh is available ONLY if explicitly
-	// mapped; any level set to null is removed. So we only need a map to (a)
-	// unlock xhigh, or (b) cap below high by nulling the higher levels.
-	const ceilingIndex = REASONING_LEVELS.indexOf(opts.reasoning);
-	const map: Record<string, string | null> = {};
-	for (const level of REASONING_LEVELS) {
-		if (level === "off") continue;
-		const index = REASONING_LEVELS.indexOf(level);
-		if (level === "xhigh") {
-			// xhigh is off unless explicitly mapped. Only enable it at the xhigh
-			// ceiling; below high it stays absent (no redundant null needed).
-			if (ceilingIndex >= index) map.xhigh = providerStringOverride?.trim() || "xhigh";
-		} else if (index > ceilingIndex) {
-			map[level] = null;
-		}
+	if (typeof opts.contextWindow === "number" && opts.contextWindow > 0) {
+		entry.contextWindow = opts.contextWindow;
 	}
 
-	if (Object.keys(map).length > 0) entry.thinkingLevelMap = map;
+	applyReasoning(entry, opts.reasoning, providerStringOverride);
 	return entry;
 }
 
@@ -799,8 +830,9 @@ async function editSingleProvider(ctx: CommandContext, providerId: string) {
 
 		const modelCount = Array.isArray(provider.models) ? provider.models.length : 0;
 		const action = await selectOne(ctx, `Edit ${providerId}`, [
-			{ value: "models", label: "Edit a model", description: `${modelCount} model${modelCount === 1 ? "" : "s"} — set reasoning / vision` },
 			{ value: "probe", label: "Re-probe for new models", description: "Query /models again and add ones not already configured" },
+			{ value: "context", label: "Set context window (all models)", description: `Apply one contextWindow to all ${modelCount} model${modelCount === 1 ? "" : "s"}` },
+			{ value: "models", label: "Edit per model", description: `${modelCount} model${modelCount === 1 ? "" : "s"} — reasoning, vision, context, max tokens, headers, delete` },
 			{ value: "add", label: "Add models manually", description: "Type model ids to add" },
 			{ value: "back", label: "Back", description: "Return to the provider list" },
 		]);
@@ -810,9 +842,55 @@ async function editSingleProvider(ctx: CommandContext, providerId: string) {
 			await editProviderModels(ctx, providerId);
 		} else if (action === "probe") {
 			await reprobeProvider(ctx, providerId);
+		} else if (action === "context") {
+			await setProviderContextWindow(ctx, providerId);
 		} else if (action === "add") {
 			await addModelsToProvider(ctx, providerId);
 		}
+	}
+}
+
+// Apply a single contextWindow value to every model in the provider, preserving
+// each model's reasoning/vision config. A value of 0 clears it from all models.
+async function setProviderContextWindow(ctx: CommandContext, providerId: string) {
+	let provider: any;
+	try {
+		provider = loadModelsConfig().providers?.[providerId];
+	} catch (error) {
+		ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return;
+	}
+	const models = Array.isArray(provider?.models) ? provider.models : [];
+	if (models.length === 0) {
+		ctx.ui.notify(`Provider "${providerId}" has no models.`, "warning");
+		return;
+	}
+
+	// Prefill with the shared value if every model already agrees, else blank.
+	const windows = models.map((m: any) => (typeof m?.contextWindow === "number" ? m.contextWindow : undefined));
+	const shared = windows.every((w: number | undefined) => w === windows[0]) ? windows[0] : undefined;
+
+	const result = await promptContextWindow(ctx, shared);
+	if (result === null) return;
+
+	const saved = await mutateProvider(ctx, providerId, (p) => {
+		const list = Array.isArray(p.models) ? p.models : [];
+		for (const m of list) {
+			const opts = readModelOptions(m);
+			opts.contextWindow = result === 0 ? undefined : result;
+			const rebuilt = buildModelEntry(modelIdOf(m), opts, readXhighProviderString(m));
+			Object.assign(m, rebuilt);
+			if (result === 0) delete m.contextWindow;
+		}
+		return true;
+	});
+	if (saved) {
+		ctx.ui.notify(
+			result === 0
+				? `Cleared context window on all ${models.length} model${models.length === 1 ? "" : "s"}.`
+				: `Set context window ${result} on all ${models.length} model${models.length === 1 ? "" : "s"}.`,
+			"info",
+		);
 	}
 }
 
@@ -847,7 +925,8 @@ async function mutateProvider(
 	return true;
 }
 
-// Pick a model, then set its reasoning ceiling and vision flag in place.
+// Pick a model, then a field to edit. Each edit mutates one field in place so
+// other fields (headers, overrides, cost) are preserved.
 async function editProviderModels(ctx: CommandContext, providerId: string) {
 	let cursor = 0;
 	while (true) {
@@ -870,28 +949,133 @@ async function editProviderModels(ctx: CommandContext, providerId: string) {
 		if (!choice) return;
 		cursor = modelItems.findIndex((item) => item.value === choice);
 
-		const current = readModelOptions(findModel(provider, choice));
-		const reasoning = await promptReasoning(ctx, current.reasoning);
-		if (reasoning === null) continue;
+		const deleted = await editSingleModel(ctx, providerId, choice);
+		if (deleted) cursor = Math.max(0, cursor - 1);
+	}
+}
 
-		let xhighProviderString: string | undefined;
-		if (reasoning === "xhigh") {
-			xhighProviderString = await promptXhighProviderString(ctx, readXhighProviderString(findModel(provider, choice)));
+// Field-picker for one model. Returns true if the model was deleted (so the
+// caller can adjust its cursor).
+async function editSingleModel(ctx: CommandContext, providerId: string, modelId: string): Promise<boolean> {
+	while (true) {
+		let model: any;
+		try {
+			model = findModel(loadModelsConfig().providers?.[providerId], modelId);
+		} catch (error) {
+			ctx.ui.notify(`Could not read ${MODELS_JSON_PATH}: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return false;
+		}
+		if (!model) {
+			ctx.ui.notify(`Model "${modelId}" no longer exists.`, "warning");
+			return false;
 		}
 
-		const vision = await promptVision(ctx, current.vision);
-		if (vision === null) continue;
+		const opts = readModelOptions(model);
+		const ctxWin = typeof model.contextWindow === "number" ? model.contextWindow : "unset";
+		const maxTok = typeof model.maxTokens === "number" ? model.maxTokens : "unset";
+		const hasHeaders = model.headers && Object.keys(model.headers).length > 0;
+		const override = model.baseUrl || model.api ? "set" : "unset";
 
-		const saved = await mutateProvider(ctx, providerId, (p) => {
-			const models = Array.isArray(p.models) ? p.models : [];
-			const index = models.findIndex((m: any) => modelIdOf(m) === choice);
-			if (index === -1) return false;
-			models[index] = buildModelEntry(choice, { reasoning, vision }, xhighProviderString);
-			p.models = models;
+		const field = await selectOne(ctx, `Edit ${modelId}`, [
+			{ value: "reasoning", label: "Reasoning", suffix: ` • ${opts.reasoning}`, description: "Set the reasoning ceiling (off → xhigh)" },
+			{ value: "vision", label: "Vision", suffix: ` • ${opts.vision ? "on" : "off"}`, description: "Toggle image input (text+image vs text-only)" },
+			{ value: "context", label: "Context window", suffix: ` • ${ctxWin}`, description: "Max context tokens for this model" },
+			{ value: "maxtokens", label: "Max output tokens", suffix: ` • ${maxTok}`, description: "Max tokens this model may generate" },
+			{ value: "override", label: "Headers / endpoint override", suffix: ` • ${hasHeaders ? "headers" : override}`, description: "Per-model HTTP headers and api/baseUrl override" },
+			{ value: "delete", label: "Delete this model", description: "Remove this model from the provider" },
+			{ value: "back", label: "Back", description: "Return to the model list" },
+		]);
+		if (!field || field === "back") return false;
+
+		if (field === "reasoning") {
+			const reasoning = await promptReasoning(ctx, opts.reasoning);
+			if (reasoning === null) continue;
+			let xhigh: string | undefined;
+			if (reasoning === "xhigh") xhigh = await promptXhighProviderString(ctx, readXhighProviderString(model));
+			await mutateModel(ctx, providerId, modelId, (m) => applyReasoning(m, reasoning, xhigh));
+		} else if (field === "vision") {
+			const vision = await promptVision(ctx, opts.vision);
+			if (vision === null) continue;
+			await mutateModel(ctx, providerId, modelId, (m) => { m.input = vision ? ["text", "image"] : ["text"]; });
+		} else if (field === "context") {
+			const result = await promptContextWindow(ctx, typeof model.contextWindow === "number" ? model.contextWindow : undefined);
+			if (result === null) continue;
+			await mutateModel(ctx, providerId, modelId, (m) => { if (result === 0) delete m.contextWindow; else m.contextWindow = result; });
+		} else if (field === "maxtokens") {
+			const result = await promptMaxTokens(ctx, typeof model.maxTokens === "number" ? model.maxTokens : undefined);
+			if (result === null) continue;
+			await mutateModel(ctx, providerId, modelId, (m) => { if (result === 0) delete m.maxTokens; else m.maxTokens = result; });
+		} else if (field === "override") {
+			await editModelOverride(ctx, providerId, modelId);
+		} else if (field === "delete") {
+			const ok = await ctx.ui.confirm("Delete model?", `Remove "${modelId}" from "${providerId}"?`);
+			if (!ok) continue;
+			const saved = await mutateProvider(ctx, providerId, (p) => {
+				const models = Array.isArray(p.models) ? p.models : [];
+				const index = models.findIndex((m: any) => modelIdOf(m) === modelId);
+				if (index === -1) return false;
+				models.splice(index, 1);
+				return true;
+			});
+			if (saved) ctx.ui.notify(`Deleted "${modelId}".`, "info");
 			return true;
-		});
-		if (saved) ctx.ui.notify(`Updated "${choice}".`, "info");
+		}
 	}
+}
+
+// Mutate a single model entry in place and save.
+async function mutateModel(ctx: CommandContext, providerId: string, modelId: string, mutate: (model: any) => void): Promise<boolean> {
+	return mutateProvider(ctx, providerId, (p) => {
+		const models = Array.isArray(p.models) ? p.models : [];
+		const index = models.findIndex((m: any) => modelIdOf(m) === modelId);
+		if (index === -1) return false;
+		// Strings become objects so per-field knobs have somewhere to live.
+		if (typeof models[index] === "string") models[index] = { id: modelId, input: ["text", "image"] };
+		mutate(models[index]);
+		return true;
+	}).then((saved) => {
+		if (saved) ctx.ui.notify(`Updated "${modelId}".`, "info");
+		return saved;
+	});
+}
+
+// Edit per-model HTTP headers and api/baseUrl endpoint override.
+async function editModelOverride(ctx: CommandContext, providerId: string, modelId: string) {
+	let model: any;
+	try {
+		model = findModel(loadModelsConfig().providers?.[providerId], modelId);
+	} catch {
+		model = undefined;
+	}
+	const currentBase = typeof model?.baseUrl === "string" ? model.baseUrl : "";
+	const currentHeaders = model?.headers && typeof model.headers === "object" ? JSON.stringify(model.headers) : "";
+
+	const base = await ctx.ui.input("baseUrl override (blank = use provider, \"-\" to clear)", currentBase || "e.g. https://api.example.com/v1");
+	if (base === undefined) return;
+	const headers = await ctx.ui.input("Headers as JSON (blank = keep, \"-\" to clear)", currentHeaders || 'e.g. {"x-api-version":"2024-01"}');
+	if (headers === undefined) return;
+
+	let parsedHeaders: Record<string, string> | null | undefined;
+	const trimmedHeaders = headers.trim();
+	if (trimmedHeaders === "-") parsedHeaders = null;
+	else if (trimmedHeaders) {
+		try {
+			const obj = JSON.parse(trimmedHeaders);
+			if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("not an object");
+			parsedHeaders = obj;
+		} catch (error) {
+			ctx.ui.notify(`Invalid headers JSON: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+	}
+
+	await mutateModel(ctx, providerId, modelId, (m) => {
+		const trimmedBase = base.trim();
+		if (trimmedBase === "-") delete m.baseUrl;
+		else if (trimmedBase) m.baseUrl = trimmedBase;
+		if (parsedHeaders === null) delete m.headers;
+		else if (parsedHeaders) m.headers = parsedHeaders;
+	});
 }
 
 function modelIdOf(model: any): string {
@@ -927,16 +1111,11 @@ async function addModelEntriesToProvider(ctx: CommandContext, providerId: string
 		return;
 	}
 
-	const reasoning = await promptReasoning(ctx);
-	if (reasoning === null) return;
-	let xhighProviderString: string | undefined;
-	if (reasoning === "xhigh") xhighProviderString = await promptXhighProviderString(ctx);
-	const vision = await promptVision(ctx);
-	if (vision === null) return;
-
+	// Added models default to reasoning on (xhigh ceiling) + text+image. Tune per
+	// model later via Edit provider → Edit a model.
 	const saved = await mutateProvider(ctx, providerId, (p) => {
 		const models = Array.isArray(p.models) ? p.models : [];
-		for (const id of fresh) models.push(buildModelEntry(id, { reasoning, vision }, xhighProviderString));
+		for (const id of fresh) models.push(buildModelEntry(id, { reasoning: "xhigh", vision: true }));
 		p.models = models;
 		return true;
 	});
@@ -1125,26 +1304,43 @@ async function confirmEndpointReuse(ctx: CommandContext, normalizedEndpoint: str
 }
 
 async function promptProviderId(ctx: CommandContext, normalizedEndpoint: string): Promise<string | null> {
-	const providerIdSuggestion = suggestProviderId(normalizedEndpoint);
-	const providerNameInput = await ctx.ui.input(
-		`Provider name (blank = ${providerIdSuggestion})`,
-		"e.g. custom-example-com",
-	);
-	if (providerNameInput === undefined) return null;
-	const providerId = slugify(providerNameInput.trim() || providerIdSuggestion);
-	if (!providerId) {
-		ctx.ui.notify("Provider name is required.", "error");
-		return null;
+	let existingIds = new Set<string>();
+	try {
+		existingIds = new Set(Object.keys(loadModelsConfig().providers ?? {}));
+	} catch {
+		// If config can't be read, persistProvider surfaces the error later.
 	}
 
-	if (BUILTIN_PROVIDER_IDS.has(providerId)) {
-		const ok = await ctx.ui.confirm(
-			"Override built-in provider?",
-			`"${providerId}" matches a built-in provider id. Saving this will override that provider in ~/.pi/agent/models.json. Continue?`,
+	const providerIdSuggestion = suggestProviderId(normalizedEndpoint);
+	const suggestionTaken = existingIds.has(providerIdSuggestion);
+
+	while (true) {
+		const providerNameInput = await ctx.ui.input(
+			suggestionTaken ? "Provider name (must be unique)" : `Provider name (blank = ${providerIdSuggestion})`,
+			"e.g. custom-example-com",
 		);
-		if (!ok) return null;
+		if (providerNameInput === undefined) return null;
+		const providerId = slugify(providerNameInput.trim() || providerIdSuggestion);
+		if (!providerId) {
+			ctx.ui.notify("Provider name is required.", "error");
+			continue;
+		}
+
+		// Provider names must be unique — never silently overwrite an existing one.
+		if (existingIds.has(providerId)) {
+			ctx.ui.notify(`Provider "${providerId}" already exists. Choose a different name.`, "warning");
+			continue;
+		}
+
+		if (BUILTIN_PROVIDER_IDS.has(providerId)) {
+			const ok = await ctx.ui.confirm(
+				"Override built-in provider?",
+				`"${providerId}" matches a built-in provider id. Saving this will override that provider in ~/.pi/agent/models.json. Continue?`,
+			);
+			if (!ok) continue;
+		}
+		return providerId;
 	}
-	return providerId;
 }
 
 async function persistProvider(ctx: CommandContext, providerId: string, providerConfig: any): Promise<boolean> {
@@ -1158,11 +1354,10 @@ async function persistProvider(ctx: CommandContext, providerId: string, provider
 
 	config.providers ||= {};
 	if (config.providers[providerId]) {
-		const replace = await ctx.ui.confirm(
-			"Replace existing provider?",
-			`Provider "${providerId}" already exists in ${MODELS_JSON_PATH}. Replace it?`,
-		);
-		if (!replace) return false;
+		// Names are validated unique at prompt time; this only triggers if the
+		// config changed underneath us. Refuse rather than overwrite.
+		ctx.ui.notify(`Provider "${providerId}" already exists. Not overwriting.`, "error");
+		return false;
 	}
 
 	config.providers[providerId] = providerConfig;
@@ -1201,25 +1396,15 @@ async function addProviderFlow(ctx: CommandContext) {
 	const modelIds = await collectModelIds(ctx, style, api, apiKey, endpoint.normalized, endpoint.raw);
 	if (!modelIds || modelIds.length === 0) return;
 
-	const reasoning = await promptReasoning(ctx);
-	if (reasoning === null) return;
-
-	let xhighProviderString: string | undefined;
-	if (reasoning === "xhigh") {
-		xhighProviderString = await promptXhighProviderString(ctx);
-	}
-
-	const vision = await promptVision(ctx);
-	if (vision === null) return;
-
 	const providerConfig = buildProviderConfig(
 		style,
 		api,
 		endpoint.normalized,
 		apiKey,
 		dedupe(modelIds),
-		{ reasoning, vision },
-		xhighProviderString,
+		// New providers default to text+image, reasoning on (xhigh ceiling). Tune
+		// per model later via Edit provider → Edit a model.
+		{ reasoning: "xhigh", vision: true },
 	);
 	if (!(await persistProvider(ctx, providerId, providerConfig))) return;
 

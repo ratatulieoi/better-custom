@@ -1,6 +1,6 @@
 {
   "name": "better-custom",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi extension package for adding and deleting custom providers through an interactive wizard.",
   "type": "module",
   "keywords": [
@@ -32,14 +32,14 @@
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "peerDependenciesMeta": {
-    "@mariozechner/pi-coding-agent": {
+    "@earendil-works/pi-coding-agent": {
       "optional": true
     },
-    "@mariozechner/pi-tui": {
+    "@earendil-works/pi-tui": {
       "optional": true
     }
   },

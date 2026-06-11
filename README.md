@@ -1,25 +1,25 @@
 # better-custom
 
-A better way to add custom provider for Pi coding agnet
+A better way to add custom providers for the Pi coding agent.
 
 ## Features
 
-- Add or delete custom providers from an interactive wizard
+- Add, edit, or delete custom providers from an interactive wizard
 - Supports:
-  - Anthropic-compatible endpoints
   - OpenAI-compatible endpoints
+  - Anthropic-compatible endpoints
   - Ollama-compatible endpoints
 - API key modes:
-  - literal API key
-  - environment variable name (saved as `$NAME`, resolved at runtime)
-  - shell command (saved as `!command`, stdout used as the key)
+  - API key (stored verbatim in `~/.pi/agent/models.json`)
   - none (writes a placeholder so the provider still loads)
+  - existing `$ENV` and `!command` keys are still resolved when re-probing
 - Auto-probe `/models` for OpenAI-compatible endpoints
 - Multi-select model picker for probed models
+- Unique provider names — the wizard refuses to overwrite an existing provider
 - Image input enabled by default (`input: ["text", "image"]`) so vision-capable
   models receive images instead of having them silently dropped
-- Optional `reasoning: true` flag for all saved models
-- Safe delete flow for existing providers
+- Reasoning enabled by default at the `xhigh` ceiling for newly added models
+- Safe delete flow for whole providers or individual models
 
 ## Install
 
@@ -46,20 +46,51 @@ After installing, reload pi if needed, then run:
 The wizard can:
 
 1. Add a provider
-2. Delete a provider
+2. Edit a provider
+3. Delete a provider
 
-When adding a provider, it will guide you through:
+### Add a provider
 
-- provider style
+Guides you through:
+
+- provider style (OpenAI / Anthropic / Ollama)
 - endpoint
-- provider name 
-- API key method (literal, env var, shell command, or none)
-- model discovery or manual model entry
-- reasoning flag
+- provider name (must be unique)
+- API key method (API key or none)
+- model discovery (auto-probe `/models`) or manual model entry
 
-Every model saved by the wizard declares `input: ["text", "image"]`, so
-vision-capable models receive image input. pi otherwise defaults custom models
-to text-only and drops images before the request.
+Newly added models default to `input: ["text", "image"]` and `reasoning: true`
+at the `xhigh` ceiling. Tune any of this later via Edit provider.
+
+### Edit a provider
+
+Pick a provider, then choose:
+
+- Re-probe for new models — query `/models` again and add ones not yet configured
+- Set context window (all models) — apply one `contextWindow` to every model
+- Edit per model — pick a model and edit a single field:
+  - Reasoning ceiling (`off` → `xhigh`)
+  - Vision (text+image vs text-only)
+  - Context window
+  - Max output tokens
+  - Headers / endpoint override (per-model `baseUrl` and JSON `headers`)
+  - Delete this model
+- Add models manually
+
+Per-model edits change one field in place, so untouched fields (cost, headers,
+overrides) are preserved.
+
+### Delete a provider
+
+Lists configured providers and removes the selected one after confirmation.
+
+## How reasoning maps to pi
+
+pi exposes six thinking levels: `off, minimal, low, medium, high, xhigh`. When a
+model has `reasoning: true`, pi treats `minimal` through `high` as available.
+`xhigh` is opt-in and only unlocked when explicitly mapped, and any level set to
+`null` is removed. The wizard writes a `thinkingLevelMap` to unlock `xhigh` or to
+cap reasoning below `high`.
 
 ## Files
 
