@@ -1,6 +1,6 @@
 # better-custom
 
-A better way to add custom providers for the Pi coding agent.
+A better way to add custom providers for Pi and Oh My Pi (OMP).
 
 ## Features
 
@@ -9,8 +9,11 @@ A better way to add custom providers for the Pi coding agent.
   - OpenAI-compatible endpoints
   - Anthropic-compatible endpoints
   - Ollama-compatible endpoints
+- Uses the running host's agent directory automatically
+  - Pi: `models.json`
+  - OMP: `models.yml` / `models.yaml`
 - API key modes:
-  - API key (stored verbatim in `~/.pi/agent/models.json`)
+  - API key (stored verbatim in the active models config)
   - none (writes a placeholder so the provider still loads)
   - existing `$ENV` and `!command` keys are still resolved when re-probing
 - Auto-probe `/models` for OpenAI-compatible endpoints
@@ -76,7 +79,7 @@ Pick a provider, then choose:
   - Headers / endpoint override (per-model `baseUrl` and JSON `headers`)
   - Delete this model
 - Add models manually
-- Rename provider — change the provider name (key) in `models.json`
+- Rename provider — change the provider name (key) in the active models config
 
 Per-model edits change one field in place, so untouched fields (cost, headers,
 overrides) are preserved.
@@ -92,6 +95,15 @@ model has `reasoning: true`, pi treats `minimal` through `high` as available.
 `xhigh` is opt-in and only unlocked when explicitly mapped, and any level set to
 `null` is removed. The wizard writes a `thinkingLevelMap` to unlock `xhigh` or to
 cap reasoning below `high`.
+
+## Configuration
+
+The extension uses the host-provided agent directory instead of hard-coding
+`~/.pi/agent`. Existing `models.yml`, `models.yaml`, or `models.json` files are
+kept in their current format. A fresh OMP config is created as `models.yml`;
+normal Pi continues to use `models.json`.
+
+Saving YAML rewrites its formatting and does not preserve comments.
 
 ## Files
 

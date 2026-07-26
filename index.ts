@@ -1,9 +1,10 @@
+import * as CodingAgent from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 type ProviderApi = "openai-completions" | "anthropic-messages";
 type ProviderStyle = "openai" | "anthropic" | "ollama";
@@ -40,7 +41,13 @@ type SelectItem = {
 
 type CommandContext = Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1];
 
-const MODELS_JSON_PATH = `${homedir()}/.pi/agent/models.json`;
+const AGENT_DIR = CodingAgent.getAgentDir();
+const IS_OMP = "logger" in CodingAgent || /(^|[\\/])\.?omp([\\/]|$)/i.test(AGENT_DIR);
+// OMP prefers YAML and still accepts legacy JSON; normal Pi uses JSON only.
+const MODELS_JSON_PATH = (IS_OMP ? ["models.yml", "models.yaml", "models.json"] : ["models.json"])
+	.map((name) => join(AGENT_DIR, name))
+	.find(existsSync) ?? join(AGENT_DIR, IS_OMP ? "models.yml" : "models.json");
+const IS_YAML_CONFIG = /\.ya?ml$/i.test(MODELS_JSON_PATH);
 const BUILTIN_PROVIDER_IDS = new Set([
 	"anthropic",
 	"openai",
@@ -74,7 +81,10 @@ function loadModelsConfig(): ModelsConfig {
 	const raw = readFileSync(MODELS_JSON_PATH, "utf8").trim();
 	if (!raw) return { providers: {} };
 
-	const parsed = JSON.parse(raw) as ModelsConfig;
+	const parsed = (IS_YAML_CONFIG ? parseYaml(raw) : JSON.parse(raw)) as ModelsConfig;
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("models config must be an object");
+	}
 	if (!parsed.providers || typeof parsed.providers !== "object") {
 		parsed.providers = {};
 	}
@@ -83,7 +93,8 @@ function loadModelsConfig(): ModelsConfig {
 
 function saveModelsConfig(config: ModelsConfig) {
 	ensureConfigDir();
-	writeFileSync(MODELS_JSON_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+	const content = IS_YAML_CONFIG ? stringifyYaml(config, { lineWidth: 0 }) : JSON.stringify(config, null, 2);
+	writeFileSync(MODELS_JSON_PATH, `${content.trimEnd()}\n`, "utf8");
 }
 
 function hasExplicitScheme(input: string): boolean {
@@ -480,13 +491,13 @@ async function promptApiKey(
 	ctx: CommandContext,
 ): Promise<{ mode: ApiKeyMode; value?: string } | null> {
 	const choice = await selectOne(ctx, "API key", [
-		{ value: "literal", label: "API key", description: "Stored verbatim in ~/.pi/agent/models.json" },
+		{ value: "literal", label: "API key", description: "Stored verbatim in the active models config" },
 		{ value: "none", label: "None", description: "No key; a placeholder is written so the provider still loads" },
 	]);
 	if (!choice) return null;
 	if (choice === "none") return { mode: "none" };
 
-	const value = await ctx.ui.input("API key", "saved directly in ~/.pi/agent/models.json");
+	const value = await ctx.ui.input("API key", "saved directly in the active models config");
 	if (value === undefined) return null;
 	const trimmed = value.trim();
 	if (!trimmed) return { mode: "none" };
@@ -834,7 +845,7 @@ async function editSingleProvider(ctx: CommandContext, providerId: string) {
 			{ value: "context", label: "Set context window (all models)", description: `Apply one contextWindow to all ${modelCount} model${modelCount === 1 ? "" : "s"}` },
 			{ value: "models", label: "Edit per model", description: `${modelCount} model${modelCount === 1 ? "" : "s"} — reasoning, vision, context, max tokens, headers, delete` },
 			{ value: "add", label: "Add models manually", description: "Type model ids to add" },
-			{ value: "rename", label: "Rename provider", description: "Change the provider name in models.json" },
+			{ value: "rename", label: "Rename provider", description: "Change the provider name in the models config" },
 			{ value: "back", label: "Back", description: "Return to the provider list" },
 		]);
 		if (!action || action === "back") return;
@@ -855,9 +866,9 @@ async function editSingleProvider(ctx: CommandContext, providerId: string) {
 	}
 }
 
-// Rename a provider's key in models.json, preserving its config and original
+// Rename a provider's key in the models config, preserving its config and original
 // position in the file. Returns the new id on success, or null if cancelled,
-// unchanged, or rejected. Only touches models.json — a currently-selected model
+// unchanged, or rejected. Only touches the models config — a currently-selected model
 // pinned to the old provider id must be reselected via /model afterwards.
 async function renameProvider(ctx: CommandContext, providerId: string): Promise<string | null> {
 	let config: ModelsConfig;
@@ -887,7 +898,7 @@ async function renameProvider(ctx: CommandContext, providerId: string): Promise<
 	if (BUILTIN_PROVIDER_IDS.has(newId)) {
 		const ok = await ctx.ui.confirm(
 			"Override built-in provider?",
-			`"${newId}" matches a built-in provider id. Saving this will override that provider in ~/.pi/agent/models.json. Continue?`,
+			`"${newId}" matches a built-in provider id. Saving this will override that provider in the active models config. Continue?`,
 		);
 		if (!ok) return null;
 	}
@@ -1396,7 +1407,7 @@ async function promptProviderId(ctx: CommandContext, normalizedEndpoint: string)
 		if (BUILTIN_PROVIDER_IDS.has(providerId)) {
 			const ok = await ctx.ui.confirm(
 				"Override built-in provider?",
-				`"${providerId}" matches a built-in provider id. Saving this will override that provider in ~/.pi/agent/models.json. Continue?`,
+				`"${providerId}" matches a built-in provider id. Saving this will override that provider in the active models config. Continue?`,
 			);
 			if (!ok) continue;
 		}
@@ -1448,8 +1459,8 @@ async function addProviderFlow(ctx: CommandContext) {
 	if (apiKey.mode === "none") {
 		ctx.ui.notify(
 			style === "ollama"
-				? 'No API key selected. Using "ollama" automatically in models.json.'
-				: 'No API key selected. Using "dummy" automatically in models.json.',
+				? 'No API key selected. Using "ollama" automatically in the models config.'
+				: 'No API key selected. Using "dummy" automatically in the models config.',
 			"info",
 		);
 	}

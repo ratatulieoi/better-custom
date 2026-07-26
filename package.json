@@ -1,7 +1,7 @@
 {
   "name": "better-custom",
-  "version": "0.3.2",
-  "description": "Pi extension package for adding and deleting custom providers through an interactive wizard.",
+  "version": "0.4.0",
+  "description": "Pi and Oh My Pi extension for managing custom providers through an interactive wizard.",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -30,6 +30,9 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
