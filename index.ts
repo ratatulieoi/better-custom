@@ -428,7 +428,7 @@ async function pickMany(
 				}
 
 				add();
-				add(theme.fg("dim", " Type to search • ↑↓ move (wraps) • space toggle • enter confirm • backspace delete • esc cancel"));
+				add(theme.fg("dim", " Type to search • ↑↓ move (wraps) • space toggle • ctrl+a toggle all • enter confirm • backspace delete • esc cancel"));
 				if (selected.size === 0) {
 					add(theme.fg("warning", " Select at least one model before confirming."));
 				}
@@ -451,6 +451,17 @@ async function pickMany(
 				if (matchesKey(data, Key.down)) {
 					if (visibleItems.length === 0) return;
 					cursor = cursor === visibleItems.length - 1 ? 0 : cursor + 1;
+					refresh();
+					return;
+				}
+				if (matchesKey(data, Key.ctrl("a"))) {
+					// Toggle every model in the current visible set (search-filtered):
+					// any unselected visible model -> select all visible; else clear all visible.
+					const anyUnselected = visibleItems.some((item) => !selected.has(item.value));
+					for (const item of visibleItems) {
+						if (anyUnselected) selected.add(item.value);
+						else selected.delete(item.value);
+					}
 					refresh();
 					return;
 				}
