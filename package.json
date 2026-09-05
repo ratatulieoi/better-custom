@@ -1,6 +1,6 @@
 {
   "name": "better-custom",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Pi and Oh My Pi extension for managing custom providers through an interactive wizard.",
   "type": "module",
   "keywords": [
